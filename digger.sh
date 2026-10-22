@@ -367,28 +367,45 @@ try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(1)
-path = sys.argv[1]
-iterate = path.endswith('[]')
-if iterate:
-    path = path[:-2]
-cur = data
-for m in re.finditer(r'\.([A-Za-z0-9_-]+)|\[(\d+)\]', path):
-    key, idx = m.group(1), m.group(2)
-    try:
-        if key is not None:
-            cur = cur.get(key) if isinstance(cur, dict) else None
-        else:
-            cur = cur[int(idx)] if isinstance(cur, list) else None
-    except Exception:
-        cur = None
-    if cur is None:
-        break
-if cur is None:
+
+def resolve(cur, tokens):
+    if not tokens:
+        return cur
+    tok = tokens[0]
+    if tok == '[]':
+        if not isinstance(cur, list):
+            return None
+        out = []
+        for item in cur:
+            r = resolve(item, tokens[1:])
+            if r is None:
+                continue
+            if isinstance(r, list):
+                out.extend(r)
+            else:
+                out.append(r)
+        return out
+    if tok.startswith('['):
+        try:
+            idx = int(tok[1:-1])
+        except ValueError:
+            return None
+        if not isinstance(cur, list) or idx >= len(cur) or idx < -len(cur):
+            return None
+        return resolve(cur[idx], tokens[1:])
+    if not isinstance(cur, dict):
+        return None
+    key = tok[1:]
+    if key not in cur:
+        return None
+    return resolve(cur[key], tokens[1:])
+
+tokens = re.findall(r'\.[A-Za-z0-9_-]+|\[\d*\]', sys.argv[1])
+res = resolve(data, tokens)
+if res is None:
     sys.exit(1)
-if iterate:
-    if not isinstance(cur, list):
-        sys.exit(1)
-    for item in cur:
+if isinstance(res, list):
+    for item in res:
         if isinstance(item, bool):
             print('true' if item else 'false')
         elif isinstance(item, (dict, list)):
@@ -397,15 +414,14 @@ if iterate:
             print('null')
         else:
             print(item)
-    sys.exit(0)
-if isinstance(cur, bool):
-    print('true' if cur else 'false')
-elif isinstance(cur, (dict, list)):
-    print(json.dumps(cur))
-elif cur is None:
+elif isinstance(res, bool):
+    print('true' if res else 'false')
+elif isinstance(res, (dict, list)):
+    print(json.dumps(res))
+elif res is None:
     print('null')
 else:
-    print(cur)
+    print(res)
 PYEOF
 
 json_get() {
@@ -612,11 +628,49 @@ resolve_host() {
     local json
     json=$(http_get "https://dns.google/resolve?name=${host}&type=A" "$HTTP_TIMEOUT" 1) || json=''
     if [[ -n "$json" ]]; then
-      ip=$(json_get "$json" '.Answer[0].data') || ip=''
+      ip=$(json_get "$json" '.Answer[].data' 2>/dev/null | head -n1 || true)
     fi
   fi
   [[ -n "$ip" ]] || return 1
   printf '%s' "$ip"
+}
+
+# Query a DNS record type. dig when available, DNS over HTTPS otherwise.
+# Returns one record per line.
+dns_query() {
+  local name="$1" type="$2" out=''
+  if have dig; then
+    out=$(dig +short +time=4 +tries=1 "$type" "$name" 2>/dev/null || true)
+  fi
+  if [[ -z "$out" ]]; then
+    local json
+    json=$(http_get "https://dns.google/resolve?name=${name}&type=${type}" "$HTTP_TIMEOUT" 1) || json=''
+    if [[ -n "$json" ]]; then
+      out=$(json_get "$json" '.Answer[].data' 2>/dev/null || true)
+      out=$(printf '%s' "$out" | tr -d '"')
+    fi
+  fi
+  [[ -z "$out" ]] && return 1
+  printf '%s' "$out"
+}
+
+# Follow a CNAME chain and print every hop, one per line.
+dns_cname_chain() {
+  local host="$1"
+  local -a hops=()
+  local current="$host" guard=0
+  while (( guard < 10 )); do
+    guard=$((guard + 1))
+    local cname
+    cname=$(dns_query "$current" CNAME 2>/dev/null | head -n1 || true)
+    [[ -z "$cname" ]] && break
+    cname="${cname%.}"
+    [[ "$cname" == "$current" ]] && break
+    hops+=("$cname")
+    current="$cname"
+  done
+  (( ${#hops[@]} == 0 )) && return 1
+  printf '%s' "${hops[*]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1387,6 +1441,238 @@ mod_tls() {
   return 0
 }
 
+# --- Module 12: CDN and WAF Detection --------------------------------------
+# Each row is: name|header list|cname pattern|issuer pattern|asn list
+CDN_TABLE=(
+  "Cloudflare|cf-ray,cf-cache-status,cf-connecting-ip,cf-request-id|cloudflare|cloudflare|13335,13336"
+  "CloudFront|x-amz-cf-id,x-amz-cf-pop,via: 1.1 amazonaws|amazonaws|amazon|16509,14618"
+  "Akamai|x-akamai-transformed,akamai-grn,x-akamai-features|akamaitechnologies|akamai|20940,16625,32787"
+  "Fastly|x-fastly-request-id,fastly-io-info,x-fastly-pop|fastly|fastly|54113"
+  "Azure CDN|x-azure-ref,x-msedge-ref,x-azure-cdn|azurefd,azureedge|azure|8075,8068"
+  "Google Cloud CDN|x-goog-generation,google-apps|x.googleapis|googleusercontent|google|15169,16591"
+  "Sucuri|x-sucuri-id,x-sucuri-cache|sucuri|sucuri|30177,39510"
+  "Vercel|x-vercel-id,server: vercel|vercel-dns|vercel|16509"
+  "Netlify|x-nf-request-id,server: netlify|netlify|netlify|10429,12389"
+  "Bunny CDN|x-bunny-cache,bunny-cache|bunnycdn|bunny|42765,45812"
+  "CDN77|x-cdn77,server: cd77|cdn77|cdn77|212238"
+  "Imperva|incap_ses,x-iinfo|incap|imperva|207267"
+  "StackPath|server: stackpath|stackpath|stackpath|47583"
+  "CacheFly|x-cache: cachefly|cachefly|cachefly|3009"
+  "KeyCDN|x-edge-location|keycdn|keycdn|20940"
+)
+
+# Each row is: name|header list|cookie fragment
+WAF_TABLE=(
+  "Cloudflare|cf-ray,cf-mitigated|x-cf-mitigated|_cf_bm"
+  "AWS WAF|x-amzn-waf|awswaf"
+  "Akamai|x-akamai-features|ak_bmsc"
+  "Imperva / Incapsula|x-iinfo|incap_ses"
+  "F5 BIG-IP|x-waf,bigipserver|BIGipServer"
+  "Sucuri WAF|x-sucuri-id|SucuriCloudIDS"
+  "Fortinet FortiWeb|x-fortiwaf|fortiwaf"
+  "Barracuda|x-barracuda|barra_counter_session"
+  "Wordfence|wfwaf|wfwaf-authcookie"
+  "ModSecurity|server: mod_security,mod_security|x-mod-security"
+  "Wallarm|x-wallarm|wallarm"
+  "Palo Alto|server: panw|panw"
+  "Radware|server: radware|x-radware"
+)
+
+mod_cdn() {
+  local target=''
+
+  while (( $# > 0 )); do
+    case "$1" in
+      -h|--help)
+        printf 'usage: digger.sh cdn <host>\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "CDN AND WAF DETECTION"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Host")
+  fi
+  target="${target// /}"
+  target="${target,,}"
+  target="${target#https://}"
+  target="${target#http://}"
+  target="${target%%/*}"
+
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+  if ! is_hostname "$target" && ! is_ip "$target"; then
+    err "invalid host: ${target}"
+    return 1
+  fi
+
+  info "Target: ${C_BOLD}${target}${C_RESET}"
+
+  # --- resolution ---------------------------------------------------------
+  local ip='' asn='' asn_org='' cnames=''
+  ip=$(resolve_host "$target" || true)
+  if [[ -n "$ip" ]]; then
+    local geo
+    geo=$(http_get "https://ipwho.is/${ip}" "$HTTP_TIMEOUT" 1) || geo=''
+    if [[ -n "$geo" ]]; then
+      asn=$(json_get "$geo" '.connection.asn' || true)
+      asn_org=$(json_get "$geo" '.connection.org' || true)
+    fi
+  fi
+  cnames=$(dns_cname_chain "$target" || true)
+
+  printf '\n%sResolution%s\n' "$C_BOLD" "$C_RESET"
+  printf '  IP address    : %s\n' "${ip:-unresolved}"
+  if [[ -n "$asn" ]]; then
+    printf '  ASN           : AS%s%s\n' "$asn" "${asn_org:+ ($asn_org)}"
+  else
+    printf '  ASN           : %sunknown%s\n' "$C_DIM" "$C_RESET"
+  fi
+  if [[ -n "$cnames" ]]; then
+    printf '  CNAME chain   : %s -> %s\n' "$target" "$cnames"
+  else
+    printf '  CNAME chain   : %snone%s\n' "$C_DIM" "$C_RESET"
+  fi
+
+  # --- HTTP headers -------------------------------------------------------
+  local url="https://${target}" headers='' code
+  code=$(final_status "$url" 12)
+  if [[ ! "$code" =~ ^[1-5] ]]; then
+    url="http://${target}"
+    code=$(final_status "$url" 12)
+  fi
+  headers=$(final_headers "$url" 12)
+
+  printf '\n%sHTTP response%s\n' "$C_BOLD" "$C_RESET"
+  printf '  URL           : %s\n' "$url"
+  printf '  Status        : %s\n' "${code:-unknown}"
+  local hname hval
+  while IFS= read -r hname; do
+    hval=$(header_value "$headers" "$hname")
+    [[ -n "$hval" ]] && printf '  %-16s: %s\n' "$hname" "$hval"
+  done <<< "server
+x-powered-by
+via
+cf-ray
+cf-cache-status
+x-amz-cf-id
+x-akamai-transformed
+x-fastly-request-id
+x-azure-ref
+x-vercel-id
+x-nf-request-id
+x-sucuri-id
+x-served-by
+x-cache
+content-type
+strict-transport-security"
+
+  # --- certificate issuer -------------------------------------------------
+  local issuer=''
+  if have openssl; then
+    issuer=$(tls_leaf_cert "$target" 443 2>/dev/null \
+      | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//; s/^ *//' || true)
+  fi
+
+  # --- detection ----------------------------------------------------------
+  # A provider is only reported as detected when a header, CNAME or
+  # certificate signature matches. An ASN match on its own is weak evidence.
+  local -a cdn_hits=() waf_hits=() cdn_weak=() waf_weak=() evidence=()
+  local row name hdrs cname_p issuer_p asns h
+  local -a hs=() sm=() wm=()
+
+  for row in "${CDN_TABLE[@]}"; do
+    IFS='|' read -r name hdrs cname_p issuer_p asns <<< "$row"
+    sm=(); wm=()
+    IFS=',' read -ra hs <<< "$hdrs"
+    for h in "${hs[@]}"; do
+      if header_present "$headers" "$h"; then
+        sm+=("header ${h}")
+      fi
+    done
+    if [[ -n "$cname_p" ]] && printf '%s' "$cnames" | grep -qi -- "$cname_p"; then
+      sm+=("CNAME contains ${cname_p}")
+    fi
+    if [[ -n "$issuer_p" ]] && printf '%s' "$issuer" | grep -qi -- "$issuer_p"; then
+      sm+=("certificate issuer contains ${issuer_p}")
+    fi
+    if [[ -n "$asns" && -n "$asn" ]] && printf ',%s,' "$asns" | grep -q ",${asn},"; then
+      wm+=("ASN AS${asn}")
+    fi
+    if (( ${#sm[@]} > 0 )); then
+      cdn_hits+=("$name")
+      for m in "${sm[@]}"; do evidence+=("CDN|${name}|${m}"); done
+    elif (( ${#wm[@]} > 0 )); then
+      cdn_weak+=("$name")
+      for m in "${wm[@]}"; do evidence+=("CDN|${name}|${m}"); done
+    fi
+  done
+
+  local cookies
+  cookies=$(printf '%s' "$headers" | grep -i '^set-cookie:' || true)
+
+  for row in "${WAF_TABLE[@]}"; do
+    IFS='|' read -r name hdrs cookie <<< "$row"
+    sm=(); wm=()
+    IFS=',' read -ra hs <<< "$hdrs"
+    for h in "${hs[@]}"; do
+      if header_present "$headers" "$h"; then
+        sm+=("header ${h}")
+      fi
+    done
+    if [[ -n "$cookie" ]] && printf '%s' "$cookies" | grep -qi -- "$cookie"; then
+      sm+=("cookie ${cookie}")
+    fi
+    if (( ${#sm[@]} > 0 )); then
+      waf_hits+=("$name")
+      for m in "${sm[@]}"; do evidence+=("WAF|${name}|${m}"); done
+    fi
+  done
+
+  printf '\n%sDetection%s\n' "$C_BOLD" "$C_RESET"
+  if (( ${#cdn_hits[@]} == 0 )); then
+    printf '  %s[-]%s no CDN signature matched\n' "$C_DIM" "$C_RESET"
+  else
+    printf '  %s[+]%s CDN: %s\n' "$C_GREEN" "$C_RESET" "${cdn_hits[*]}"
+  fi
+  if (( ${#cdn_weak[@]} > 0 )); then
+    printf '  %s[!]%s possible CDN (ASN only): %s\n' "$C_YELLOW" "$C_RESET" "${cdn_weak[*]}"
+  fi
+  if (( ${#waf_hits[@]} == 0 )); then
+    printf '  %s[-]%s no WAF signature matched\n' "$C_DIM" "$C_RESET"
+  else
+    printf '  %s[+]%s WAF: %s\n' "$C_GREEN" "$C_RESET" "${waf_hits[*]}"
+  fi
+
+  if (( ${#evidence[@]} > 0 )); then
+    printf '\n%sEvidence%s\n' "$C_BOLD" "$C_RESET"
+    local e kind who what
+    for e in "${evidence[@]}"; do
+      IFS='|' read -r kind who what <<< "$e"
+      printf '  %-4s %-20s %s\n' "$kind" "$who" "$what"
+    done
+  fi
+
+  # --- host header behaviour ---------------------------------------------
+  printf '\n%sHost header handling%s\n' "$C_BOLD" "$C_RESET"
+  local hcode
+  hcode=$(curl -s -o /dev/null -k -L --max-time 10 -H "User-Agent: $USER_AGENT" \
+    -H "Host: definitely-not-a-real-host-zzz.invalid" -w '%{http_code}' "$url" 2>/dev/null || true)
+  if [[ "$hcode" == "$code" ]]; then
+    printf '  %s[!]%s the server answers the same for an unknown Host header\n' "$C_YELLOW" "$C_RESET"
+  else
+    printf '  %s[+]%s the server reacts to the Host header (%s -> %s)\n' "$C_GREEN" "$C_RESET" "$code" "$hcode"
+  fi
+  return 0
+}
+
 # --- Module 2: Info IP and Site -------------------------------------------
 mod_info() {
   local target="${1:-}"
@@ -1851,31 +2137,44 @@ mod_dns() {
   info "Target: ${C_BOLD}${target}${C_RESET}"
   hr 60
 
-  if ! have dig; then
-    err "dig is required for this module (sudo apt-get install -y dnsutils)"
+  if ! have dig && ! have curl; then
+    err "dig or curl is required for this module (sudo apt-get install -y dnsutils)"
     return 1
   fi
+  if ! have dig; then
+    printf '%s[!]%s dig not found, falling back to DNS over HTTPS\n' "$C_YELLOW" "$C_RESET"
+  fi
 
-  local rec out
+  local rec out line
   local -a records=(A AAAA MX NS TXT CNAME SOA CAA)
+  local found=0
 
   for rec in "${records[@]}"; do
-    out=$(dig +noall +answer +time=4 +tries=1 "$target" "$rec" 2>/dev/null || true)
-    if [[ -z "$out" ]]; then
-      continue
-    fi
+    out=$(dns_query "$target" "$rec" 2>/dev/null || true)
+    [[ -z "$out" ]] && continue
+    found=1
     printf '\n%s%s records%s\n' "$C_BOLD" "$rec" "$C_RESET"
-    printf '%s\n' "$out" | awk -v c="$C_DIM" -v r="$C_RESET" '{
-      name=$1; ttl=$2; type=$4; data="";
-      for (i=5; i<=NF; i++) data = data (i>5 ? " " : "") $i;
-      printf "  %-40s %-8s %s\n", name, ttl, data;
-    }'
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      printf '  %s\n' "$line"
+    done <<< "$out"
   done
+
+  if (( found == 0 )); then
+    printf '\n%sno records found%s\n' "$C_DIM" "$C_RESET"
+  fi
 
   # PTR for IP inputs
   if is_ip "$target"; then
-    local rev
-    rev=$(dig +short -x "$target" +time=4 +tries=1 2>/dev/null || true)
+    local rev=''
+    if have dig; then
+      rev=$(dig +short -x "$target" +time=4 +tries=1 2>/dev/null || true)
+    fi
+    if [[ -z "$rev" ]] && is_ipv4 "$target"; then
+      local rev4
+      rev4=$(printf '%s' "$target" | awk -F. '{print $4"."$3"."$2"."$1}')
+      rev=$(dns_query "${rev4}.in-addr.arpa" PTR 2>/dev/null || true)
+    fi
     printf '\n%sPTR record%s\n' "$C_BOLD" "$C_RESET"
     if [[ -n "$rev" ]]; then
       printf '  %s\n' "$rev"
@@ -1982,7 +2281,7 @@ menu() {
       9) pending "archive" 9 ;;
       10) mod_paths ;;
       11) mod_tls ;;
-      12) pending "cdn" 11 ;;
+      12) mod_cdn ;;
       13) pending "intel" 12 ;;
       14) pending "secrets" 17 ;;
       15) pending "dorks" 18 ;;
@@ -2033,7 +2332,7 @@ main() {
     archive)   pending "archive" 9 ;;
     paths)     mod_paths ${rest[@]+"${rest[@]}"} ;;
     tls)       mod_tls ${rest[@]+"${rest[@]}"} ;;
-    cdn)       pending "cdn" 11 ;;
+    cdn)       mod_cdn ${rest[@]+"${rest[@]}"} ;;
     intel)     pending "intel" 12 ;;
     secrets)   pending "secrets" 17 ;;
     dorks)     pending "dorks" 18 ;;

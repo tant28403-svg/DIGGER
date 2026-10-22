@@ -166,9 +166,20 @@ run tls 'not a host!!'
 expect_match "tls rejects garbage" 'invalid host'
 
 # ---------------------------------------------------------------------------
+section "module: cdn"
+
+run cdn example.com
+expect_match "cdn reports detection" 'Detection'
+expect_match "cdn reports resolution" 'ASN|IP address'
+expect_status "cdn exits 0" 0
+
+run cdn 'not a host!!'
+expect_match "cdn rejects garbage" 'invalid host'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in scan hosts subdomains archive cdn intel secrets dorks social net; do
+for m in scan hosts subdomains archive intel secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done
