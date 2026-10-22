@@ -264,9 +264,31 @@ run secrets --help
 expect_match "secrets has its own usage" 'digger.sh secrets'
 
 # ---------------------------------------------------------------------------
+section "module: archive"
+
+run archive 'bad host!!'
+expect_match "archive rejects garbage" 'invalid target'
+
+run archive example.com --year 20x5
+expect_match "archive rejects a bad year" 'invalid year'
+
+run archive this-domain-does-not-exist-xyz123.com
+expect_match "archive reports an empty history" 'no captures found'
+expect_status "archive handles an empty history" 0
+
+run archive example.com --limit 20 --recent 2
+expect_match "archive prints coverage" 'Coverage'
+expect_match "archive prints a timeline" 'Days archived per year'
+expect_match "archive prints a summary" 'Summary'
+expect_status "archive runs" 0
+
+run archive --help
+expect_match "archive has its own usage" 'digger.sh archive'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in archive dorks social net; do
+for m in dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done

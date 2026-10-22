@@ -209,6 +209,7 @@ ${C_BOLD}COMMANDS${C_RESET}
   tls <host[:port]>          certificates, protocol versions and ciphers
   cdn <domain|url>           CDN and WAF detection
   intel <ip|domain>          threat intel, DNSBL and blocklist lookups
+  archive <domain|url>       archived snapshots, coverage and recent captures
   secrets <url>              crawl a site and flag API keys, tokens and leaks
 
 ${C_BOLD}OPTIONS${C_RESET}
@@ -1002,6 +1003,212 @@ mod_links() {
     printf '\n%sExternal links%s (%s)\n' "$C_BOLD" "$C_RESET" "$(printf '%s\n' "$uniq_ext" | grep -c . || true)"
     printf '%s\n' "$uniq_ext" | sed 's/^/  /'
   fi
+  return 0
+}
+
+# --- Module 9: Historical Snapshots ----------------------------------------
+WAYBACK_CDX='https://web.archive.org/cdx/search/cdx'
+
+# CDX rows: one 14 digit timestamp per record. Status codes are optional
+# ("-"), so the timeline query asks for timestamps only.
+archive_rows() {
+  grep -oE '"[0-9]{14}"' | tr -d '"' || true
+}
+
+# Recent captures also carry a status and the original URL.
+archive_rows_full() {
+  grep -oE '"[0-9]{14}","[^"]*","[^"]*"' \
+    | sed -E 's/"([0-9]{14})","([^"]*)","([^"]*)"/\1\t\2\t\3/' || true
+}
+
+# 20020120142510 -> 2002-01-20 14:25:10
+archive_stamp() {
+  local t="$1"
+  if [[ "$t" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+    printf '%s-%s-%s %s:%s:%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+      "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}"
+  else
+    printf '%s' "$t"
+  fi
+}
+
+mod_archive() {
+  local target='' limit=20000 recent=10 subdomains=0
+  local status='' from='' to='' year=''
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --limit)      limit="${2:-20000}"; shift 2 || shift ;;
+      --recent)     recent="${2:-10}"; shift 2 || shift ;;
+      --subdomains) subdomains=1; shift ;;
+      --status)     status="${2:-}"; shift 2 || shift ;;
+      --from)       from="${2:-}"; shift 2 || shift ;;
+      --to)         to="${2:-}"; shift 2 || shift ;;
+      --year)       year="${2:-}"; shift 2 || shift ;;
+      -h|--help)
+        printf 'usage: digger.sh archive <domain|url> [--year YYYY] [--from STAMP] [--to STAMP] [--status CODE] [--subdomains] [--limit N] [--recent N]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "HISTORICAL SNAPSHOTS"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Domain or URL")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+  target="${target#*://}"
+  target="${target%%#*}"
+  target="${target%%\?*}"
+  target="${target%/}"
+
+  local host="${target%%/*}"
+  host="${host%%:*}"
+  if ! is_hostname "$host" && ! is_ip "$host"; then
+    err "invalid target: ${target}"
+    return 1
+  fi
+
+  [[ "$limit" =~ ^[0-9]+$ ]] && (( limit > 0 )) || limit=20000
+  [[ "$recent" =~ ^[0-9]+$ ]] && (( recent > 0 )) || recent=10
+  [[ "$status" =~ ^[0-9]{3}$ ]] || status=''
+  [[ "$from" =~ ^[0-9]{4,14}$ ]] || from=''
+  [[ "$to" =~ ^[0-9]{4,14}$ ]] || to=''
+
+  if [[ -n "$year" ]]; then
+    if [[ "$year" =~ ^[0-9]{4}$ ]]; then
+      [[ -z "$from" ]] && from="${year}0101"
+      [[ -z "$to" ]] && to="${year}1231"
+    else
+      err "invalid year: ${year}"
+      return 1
+    fi
+  fi
+
+  local query="url=${target}&output=json&collapse=timestamp:8"
+  (( subdomains )) && query="${query}&matchType=domain"
+  [[ -n "$status" ]] && query="${query}&filter=statuscode:${status}"
+  [[ -n "$from" ]] && query="${query}&from=${from}"
+  [[ -n "$to" ]] && query="${query}&to=${to}"
+
+  info "Target: ${C_BOLD}${target}${C_RESET}"
+  printf '  Source      : web.archive.org CDX %s(keyless, passive)%s\n' \
+    "$C_DIM" "$C_RESET"
+  (( subdomains )) && printf '  Scope       : the domain and every subdomain\n'
+  [[ -n "$year" ]] && printf '  Year        : %s\n' "$year"
+
+  printf '\n  %squerying the wayback index...%s\n' "$C_DIM" "$C_RESET"
+  local json1
+  json1=$(http_get "${WAYBACK_CDX}?${query}&fl=timestamp&limit=${limit}" 60 0) || json1=''
+
+  if [[ -z "$json1" || "$json1" == '[]' ]]; then
+    warn "no captures found for ${target}"
+    printf '  %snothing archived, or the index is rate limiting right now%s\n' \
+      "$C_DIM" "$C_RESET"
+    return 0
+  fi
+  if [[ "$json1" != \[* ]]; then
+    warn "the wayback index did not return JSON (rate limited or unavailable)"
+    return 1
+  fi
+
+  local timeline total first_ts last_ts tl
+  timeline=$(printf '%s\n' "$json1" | archive_rows)
+  total=$(printf '%s\n' "$timeline" | grep -c . || true)
+  if (( ${total:-0} == 0 )); then
+    warn "no captures found for ${target}"
+    return 0
+  fi
+  # Avoid head/tail here: piping a large variable into them raises SIGPIPE,
+  # and pipefail would take the whole script down with it.
+  tl="${timeline%$'\n'}"
+  first_ts="${tl%%$'\n'*}"
+  first_ts="${first_ts%%$'\t'*}"
+  last_ts="${tl##*$'\n'}"
+  last_ts="${last_ts%%$'\t'*}"
+
+  # --- availability -------------------------------------------------------
+  # The availability endpoint ignores the CDX time filters, so only ask when
+  # the report covers the full history.
+  local avail closest_url='' closest_ts='' closest_status=''
+  if [[ -z "$from" && -z "$to" ]]; then
+    avail=$(http_get "https://archive.org/wayback/available?url=${target}" 20 1) || avail=''
+    if [[ -n "$avail" ]]; then
+      closest_url=$(json_get "$avail" '.archived_snapshots.closest.url' 2>/dev/null || true)
+      closest_ts=$(json_get "$avail" '.archived_snapshots.closest.timestamp' 2>/dev/null || true)
+      closest_status=$(json_get "$avail" '.archived_snapshots.closest.status' 2>/dev/null || true)
+    fi
+  fi
+
+  printf '\n%sCoverage%s\n' "$C_BOLD" "$C_RESET"
+  printf '  first capture : %s\n' "$(archive_stamp "$first_ts")"
+  printf '  last capture  : %s\n' "$(archive_stamp "$last_ts")"
+  printf '  days archived : %s\n' "$total"
+  printf '  span          : %s - %s\n' "${first_ts:0:4}" "${last_ts:0:4}"
+  if [[ -n "$closest_url" ]]; then
+    printf '  closest       : %s (%s)\n' "$(archive_stamp "$closest_ts")" "${closest_status:-?}"
+    printf '    %s%s%s\n' "$C_DIM" "$closest_url" "$C_RESET"
+  fi
+  if (( total >= limit )); then
+    printf '  %scapped at %s days, raise --limit for the full history%s\n' \
+      "$C_DIM" "$limit" "$C_RESET"
+  fi
+
+  # --- timeline -----------------------------------------------------------
+  local year_counts
+  year_counts=$(printf '%s\n' "$timeline" | cut -f1 | cut -c1-4 \
+    | sort | uniq -c | awk '{print $2"\t"$1}')
+
+  local max=0 y n bar len
+  while IFS=$'\t' read -r y n || [[ -n "$y" ]]; do
+    [[ -z "$y" ]] && continue
+    (( n > max )) && max=$n
+  done <<< "$year_counts"
+
+  printf '\n%sDays archived per year%s\n' "$C_BOLD" "$C_RESET"
+  while IFS=$'\t' read -r y n || [[ -n "$y" ]]; do
+    [[ -z "$y" ]] && continue
+    len=0
+    if (( max > 0 )); then
+      len=$(( n * 28 / max ))
+    fi
+    (( n > 0 && len < 1 )) && len=1
+    bar=$(printf '%*s' "$len" '' | tr ' ' '#')
+    printf '  %s  %-28s %s\n' "$y" "$bar" "$n"
+  done <<< "$year_counts"
+
+  # --- recent captures ----------------------------------------------------
+  local json2 rows2
+  json2=$(http_get "${WAYBACK_CDX}?${query}&fl=timestamp,statuscode,original&limit=-${recent}" 60 0) || json2=''
+  rows2=$(printf '%s\n' "$json2" | archive_rows_full)
+
+  if [[ -n "$rows2" ]]; then
+    printf '\n%sRecent captures%s\n' "$C_BOLD" "$C_RESET"
+    local ts code orig
+    while IFS=$'\t' read -r ts code orig; do
+      [[ -z "$ts" ]] && continue
+      printf '  %s  %s  %s\n' "$(archive_stamp "$ts")" "$code" "$orig"
+      printf '    %shttps://web.archive.org/web/%s/%s%s\n' \
+        "$C_DIM" "$ts" "$orig" "$C_RESET"
+    done <<< "$rows2"
+  fi
+
+  # --- summary ------------------------------------------------------------
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Target    : %s\n' "$target"
+  printf '  Captures  : %s days\n' "$total"
+  printf '  Range     : %s to %s\n' "${first_ts:0:4}" "${last_ts:0:4}"
+  [[ -n "$closest_url" ]] && printf '  Closest   : %s\n' "$closest_url"
+  printf '  %sarchived copies often expose old paths, parameters and source%s\n' \
+    "$C_DIM" "$C_RESET"
   return 0
 }
 
@@ -4040,12 +4247,13 @@ module_registry() {
   cmd cdn 11 "CDN and WAF detection"
   cmd intel 12 "threat intel and DNSBL"
   cmd subdomains 14 "subdomain finder"
+  cmd archive 18 "historical snapshots (wayback)"
   cmd hosts 15 "host finder (IP pivot)"
   cmd scan 16 "port scanner"
   cmd secrets 17 "API and secret discovery"
-  cmd dorks 18 "search dork generator"
-  cmd social 19 "social footprint"
-  cmd net 20 "network path"
+  cmd dorks 19 "search dork generator"
+  cmd social 20 "social footprint"
+  cmd net 21 "network path"
 }
 pending() {
   local name="$1" step="$2"
@@ -4094,7 +4302,7 @@ menu() {
       5) mod_hosts ;;
       7) mod_links ;;
       8) mod_subdomains ;;
-      9) pending "archive" 9 ;;
+      9) mod_archive ;;
       10) mod_paths ;;
       11) mod_tls ;;
       12) mod_cdn ;;
@@ -4145,7 +4353,7 @@ main() {
     hosts)     mod_hosts ${rest[@]+"${rest[@]}"} ;;
     links)     mod_links ${rest[@]+"${rest[@]}"} ;;
     subdomains) mod_subdomains ${rest[@]+"${rest[@]}"} ;;
-    archive)   pending "archive" 9 ;;
+    archive)   mod_archive ${rest[@]+"${rest[@]}"} ;;
     paths)     mod_paths ${rest[@]+"${rest[@]}"} ;;
     tls)       mod_tls ${rest[@]+"${rest[@]}"} ;;
     cdn)       mod_cdn ${rest[@]+"${rest[@]}"} ;;
