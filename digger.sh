@@ -212,6 +212,7 @@ ${C_BOLD}COMMANDS${C_RESET}
   archive <domain|url>       archived snapshots, coverage and recent captures
   dorks <domain>             search engine dorks by category, offline
   social <handle|domain>     username checks across public platforms
+  net <host|ip>              traceroute with ASN and network labels
   secrets <url>              crawl a site and flag API keys, tokens and leaks
 
 ${C_BOLD}OPTIONS${C_RESET}
@@ -1033,6 +1034,344 @@ mod_links() {
   if [[ -n "$uniq_ext" ]]; then
     printf '\n%sExternal links%s (%s)\n' "$C_BOLD" "$C_RESET" "$(printf '%s\n' "$uniq_ext" | grep -c . || true)"
     printf '%s\n' "$uniq_ext" | sed 's/^/  /'
+  fi
+  return 0
+}
+
+# --- Module 17: Network Path -----------------------------------------------
+# Traceroute with ASN enrichment. Everything keyless: the local traceroute
+# does the probing, Team Cymru's DNS zone (over DoH) labels the networks.
+net_is_private() {
+  local ip="$1"
+  [[ "$ip" =~ ^10[.] ]] && return 0
+  [[ "$ip" =~ ^192[.]168[.] ]] && return 0
+  [[ "$ip" =~ ^172[.](1[6-9]|2[0-9]|3[01])[.] ]] && return 0
+  [[ "$ip" =~ ^127[.] ]] && return 0
+  [[ "$ip" == '::1' ]] && return 0
+  return 1
+}
+
+net_shorten() {
+  local s="$1" w="${2:-42}"
+  if (( ${#s} > w )); then
+    printf '%s...' "${s:0:w-3}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# One hop line per reply: number<TAB>ip<TAB>name<TAB>rtt
+net_parse_traceroute() {
+  local line n rest ip name rtt
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]] || continue
+    n="${BASH_REMATCH[1]}"
+    rest="${BASH_REMATCH[2]}"
+    if [[ "$rest" == '*'* ]]; then
+      printf '%s\t*\t-\t-\n' "$n"
+      continue
+    fi
+    if [[ "$rest" =~ ^([^[:space:]]+)[[:space:]]+\(([^\)]+)\) ]]; then
+      name="${BASH_REMATCH[1]}"
+      ip="${BASH_REMATCH[2]}"
+      rest="${rest#*)}"
+    else
+      ip="${rest%%[[:space:]]*}"
+      name=''
+      rest="${rest#"$ip"}"
+    fi
+    rtt=''
+    if [[ "$rest" =~ ([0-9]+([.][0-9]+)?)[[:space:]]+ms ]]; then
+      rtt="${BASH_REMATCH[1]}"
+    fi
+    [[ -z "$rtt" ]] && rtt='-'
+    printf '%s\t%s\t%s\t%s\n' "$n" "$ip" "$name" "$rtt"
+  done <<< "$1"
+}
+
+# mtr -r -n rows: "  1.|-- 192.168.1.1   0.0%     1   1.2 ..."
+net_parse_mtr() {
+  local line n ip loss avg
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*([0-9]+)[.]\|--[[:space:]]+([^[:space:]]+) ]] || continue
+    n="${BASH_REMATCH[1]}"
+    ip="${BASH_REMATCH[2]}"
+    loss=$(printf '%s' "$line" | awk '{print $3}' | tr -d '%')
+    avg=$(printf '%s' "$line" | awk '{print $6}')
+    [[ "$ip" == '???' ]] && ip='*'
+    if [[ "$ip" == '*' || "${loss:-0}" == '100' ]]; then
+      printf '%s\t*\t-\t-\n' "$n"
+      continue
+    fi
+    [[ "$avg" =~ ^[0-9.]+$ ]] || avg='-'
+    printf '%s\t%s\t-\t%s\n' "$n" "$ip" "$avg"
+  done <<< "$1"
+}
+
+# Ping walking TTLs: works unprivileged on Linux when ping has cap_net_raw.
+net_ping_trace() {
+  local host="$1" maxhops="$2" wait="$3"
+  local ttl out ip rtt
+  for (( ttl = 1; ttl <= maxhops; ttl++ )); do
+    out=$(ping -c 1 -W "$wait" -t "$ttl" "$host" 2>&1 || true)
+    rtt='-'
+    if [[ "$out" =~ time=([0-9.]+)[[:space:]]*ms ]]; then
+      rtt="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$out" =~ [Tt]ime[[:space:]]to[[:space:]]live[[:space:]]exceeded || "$out" =~ TTL[[:space:]]expired ]]; then
+      if [[ "$out" =~ [Ff]rom[[:space:]]+([0-9A-Fa-f.:]+) ]]; then
+        ip="${BASH_REMATCH[1]%:}"
+        printf '%s\t%s\t-\t%s\n' "$ttl" "$ip" "$rtt"
+        continue
+      fi
+    fi
+    if [[ "$out" =~ [0-9]+[[:space:]]+bytes[[:space:]]+from[[:space:]]+([0-9A-Fa-f.:]+) ]]; then
+      ip="${BASH_REMATCH[1]%:}"
+      printf '%s\t%s\t-\t%s\n' "$ttl" "$ip" "$rtt"
+      return 0
+    fi
+    printf '%s\t*\t-\t-\n' "$ttl"
+  done
+  return 0
+}
+
+net_ping_supports_ttl() {
+  local out
+  out=$(ping -c 1 -W 1 -t 1 127.0.0.1 2>&1 || true)
+  [[ "$out" == *bytes*from* || "$out" == *'bytes from'* ]]
+}
+
+# Resolve one address to "AS<number> | prefix | organisation".
+net_asn_lookup() {
+  local ip="$1" name json txt asn prefix org t
+  [[ -z "$ip" || "$ip" == '*' ]] && return 0
+  net_is_private "$ip" && return 0
+  is_ipv4 "$ip" || return 0
+
+  name=$(printf '%s' "$ip" | awk -F. '{print $4"."$3"."$2"."$1".origin.asn.cymru.com"}')
+  json=$(http_get "https://dns.google/resolve?name=${name}&type=TXT" 12 0) || json=''
+  txt=$(json_get "$json" '.Answer[].data' 2>/dev/null | head -n1 || true)
+  txt="${txt#\"}"; txt="${txt%\"}"
+  [[ -z "$txt" ]] && return 0
+
+  asn=$(printf '%s' "$txt" | cut -d'|' -f1 | tr -d ' ')
+  prefix=$(printf '%s' "$txt" | cut -d'|' -f2 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+  org=''
+  if [[ -n "$asn" ]]; then
+    json=$(http_get "https://dns.google/resolve?name=AS${asn}.asn.cymru.com&type=TXT" 12 0) || json=''
+    t=$(json_get "$json" '.Answer[].data' 2>/dev/null | head -n1 || true)
+    t="${t#\"}"; t="${t%\"}"
+    if [[ -n "$t" ]]; then
+      org=$(printf '%s' "$t" | cut -d'|' -f5 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$ip" "${asn:+AS${asn}}" "${prefix:--}" "${org:--}"
+}
+
+# Look up every hop concurrently; results arrive as lines for the caller.
+net_asn_all() {
+  local -a pids=()
+  local ip
+  for ip in "$@"; do
+    net_asn_lookup "$ip" &
+    pids+=($!)
+    if (( ${#pids[@]} >= 5 )); then
+      wait "${pids[0]}" 2>/dev/null || true
+      pids=("${pids[@]:1}")
+    fi
+  done
+  wait 2>/dev/null || true
+}
+
+mod_net() {
+  local target='' maxhops=20 wait=2 no_asn=0
+  local hops_out='' used_engine=''
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --max-hops) maxhops="${2:-20}"; shift 2 || shift ;;
+      --timeout)  wait="${2:-2}"; shift 2 || shift ;;
+      --no-asn)   no_asn=1; shift ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      -h|--help)
+        printf 'usage: digger.sh net <host|ip> [--max-hops N] [--timeout SEC] [--no-asn]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "NETWORK PATH"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Host or IP")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+  target="${target#*://}"
+  target="${target%%/*}"
+  target="${target%.}"
+  target="${target,,}"
+  if ! is_valid_target "$target"; then
+    err "invalid target: ${target}"
+    return 1
+  fi
+
+  [[ "$maxhops" =~ ^[0-9]+$ ]] && (( maxhops > 0 && maxhops <= 64 )) || maxhops=20
+  [[ "$wait" =~ ^[0-9]+$ ]] && (( wait > 0 )) || wait=2
+
+  local ip=''
+  if is_ip "$target"; then
+    ip="$target"
+  else
+    ip=$(resolve_host "$target" || true)
+  fi
+  if [[ -z "$ip" ]]; then
+    err "could not resolve ${target}"
+    return 1
+  fi
+
+  local ptr
+  ptr=$(host_ptr "$ip" || true)
+  info "Target: ${C_BOLD}${target}${C_RESET} (${ip})"
+  [[ -n "$ptr" && "$ptr" != "$target" ]] && printf '  PTR         : %s\n' "$ptr"
+
+  # --- engine selection ---------------------------------------------------
+  local can_ping=0
+  have ping && net_ping_supports_ttl && can_ping=1
+
+  printf '\n%sTrace%s\n' "$C_BOLD" "$C_RESET"
+  printf '  max hops    : %s\n' "$maxhops"
+  printf '  wait        : %ss per probe\n' "$wait"
+  if have traceroute; then
+    printf '  engine      : traceroute (UDP probes, no root)\n'
+  elif have mtr; then
+    printf '  engine      : mtr (report mode)\n'
+  elif (( can_ping )); then
+    printf '  engine      : ping with a walking TTL %s(no traceroute installed)%s\n' \
+      "$C_DIM" "$C_RESET"
+  else
+    printf '  engine      : %snone available%s\n' "$C_YELLOW" "$C_RESET"
+  fi
+  (( no_asn )) && printf '  enrichment  : disabled (--no-asn)\n'
+
+  if ! have traceroute && ! have mtr && (( can_ping == 0 )); then
+    warn "no traceroute, mtr or TTL capable ping found"
+    printf '  %sinstall traceroute or mtr to map the path%s\n' "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  if ! confirm "This sends up to ${maxhops} trace probes towards ${ip}. Continue?"; then
+    warn "aborted"
+    return 0
+  fi
+
+  # --- run the trace ------------------------------------------------------
+  local -a hop_lines=()
+  local tmo=$(( maxhops * wait + 15 ))
+
+  if have traceroute; then
+    hops_out=$(timeout "$tmo" traceroute -m "$maxhops" -w "$wait" -q 1 "$ip" 2>&1 || true)
+    if [[ -n "$hops_out" ]]; then
+      mapfile -t hop_lines < <(net_parse_traceroute "$hops_out")
+      (( ${#hop_lines[@]} > 0 )) && used_engine='traceroute'
+    fi
+  fi
+
+  if (( ${#hop_lines[@]} == 0 )) && have mtr; then
+    hops_out=$(timeout "$tmo" mtr -r -c 1 -n --udp -m "$maxhops" "$ip" 2>&1 || true)
+    if [[ -n "$hops_out" ]]; then
+      mapfile -t hop_lines < <(net_parse_mtr "$hops_out")
+      (( ${#hop_lines[@]} > 0 )) && used_engine='mtr'
+    fi
+  fi
+
+  if (( ${#hop_lines[@]} == 0 )) && (( can_ping )); then
+    used_engine='ping'
+    mapfile -t hop_lines < <(net_ping_trace "$ip" "$maxhops" "$wait")
+  fi
+
+  if (( ${#hop_lines[@]} == 0 )); then
+    warn "the trace produced no hops"
+    printf '%s\n' "$hops_out" | sed -n '1,5p'
+    return 0
+  fi
+
+  # --- ASN enrichment -----------------------------------------------------
+  local -A asn_info=()
+  local -A seen_ip=()
+  local -a uniq_ips=()
+  local line n hip hname rtt
+  for line in "${hop_lines[@]}"; do
+    IFS=$'\t' read -r n hip hname rtt <<< "$line"
+    [[ "$hip" == '*' ]] && continue
+    [[ -n "${seen_ip[$hip]:-}" ]] && continue
+    net_is_private "$hip" && continue
+    seen_ip["$hip"]=1
+    uniq_ips+=("$hip")
+  done
+
+  if (( no_asn == 0 )) && (( ${#uniq_ips[@]} > 0 )); then
+    printf '\n  %slooking up %s networks...%s\n' "$C_DIM" "${#uniq_ips[@]}" "$C_RESET"
+    local raw_asn a_ip a_asn a_prefix a_org
+    raw_asn=$(net_asn_all "${uniq_ips[@]}")
+    while IFS=$'\t' read -r a_ip a_asn a_prefix a_org; do
+      [[ -z "$a_ip" ]] && continue
+      asn_info["$a_ip"]="${a_asn}|${a_prefix}|${a_org}"
+    done <<< "$raw_asn"
+  fi
+
+  # --- display ------------------------------------------------------------
+  printf '\n%sHops%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %s%-3s %-44s %-9s %-20s %s%s\n' "$C_DIM" '#' 'ADDRESS' 'ASN' 'NETWORK' 'RTT' "$C_RESET"
+
+  local replies=0 silent=0 reached=0 last_asn=''
+  local addr info_line asn prefix org
+  for line in "${hop_lines[@]}"; do
+    IFS=$'\t' read -r n hip hname rtt <<< "$line"
+    if [[ "$hip" == '*' ]]; then
+      printf '  %s%-3s %-44s %-9s %-20s %s%s\n' "$C_DIM" "$n" '*' '-' '-' '-' "$C_RESET"
+      silent=$((silent + 1))
+      continue
+    fi
+    replies=$((replies + 1))
+    addr="$hip"
+    [[ -n "$hname" && "$hname" != "$hip" && "$hname" != '-' ]] && addr="${hname} (${hip})"
+    asn='-'; prefix='-'; org=''
+    info_line="${asn_info[$hip]:-}"
+    if [[ -n "$info_line" ]]; then
+      IFS='|' read -r asn prefix org <<< "$info_line"
+    fi
+    local rtt_col='-'
+    [[ "$rtt" != '-' ]] && rtt_col="${rtt} ms"
+    printf '  %-3s %-44s %-9s %-20s %s\n' "$n" "$(net_shorten "$addr" 44)" "$asn" \
+      "$(net_shorten "$prefix" 20)" "$rtt_col"
+    [[ "$asn" != '-' ]] && last_asn="${asn}|${org}"
+    if [[ "$hip" == "$ip" ]]; then
+      reached=1
+    fi
+  done
+
+  # --- summary ------------------------------------------------------------
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Target   : %s (%s)\n' "$target" "$ip"
+  printf '  Engine   : %s\n' "${used_engine:-unknown}"
+  printf '  Hops     : %s (%s replied, %s silent)\n' \
+    "${#hop_lines[@]}" "$replies" "$silent"
+  if (( reached )); then
+    printf '  Reached  : yes\n'
+  else
+    printf '  Reached  : %sno direct reply from %s%s\n' "$C_DIM" "$ip" "$C_RESET"
+  fi
+  if [[ -n "$last_asn" ]]; then
+    asn="${last_asn%%|*}"
+    org="${last_asn#*|}"
+    printf '  Last ASN : %s %s\n' "$asn" "$org"
   fi
   return 0
 }
@@ -4724,7 +5063,7 @@ menu() {
       14) mod_secrets ;;
       15) mod_dorks ;;
       16) mod_social ;;
-      17) pending "net" 20 ;;
+      17) mod_net ;;
       0) printf '\n%sbye%s\n' "$C_DIM" "$C_RESET"; return 0 ;;
       '') : ;;
       *) warn "invalid option: ${choice}" ;;
@@ -4775,7 +5114,7 @@ main() {
     secrets)   mod_secrets ${rest[@]+"${rest[@]}"} ;;
     dorks)     mod_dorks ${rest[@]+"${rest[@]}"} ;;
     social)    mod_social ${rest[@]+"${rest[@]}"} ;;
-    net)       pending "net" 20 ;;
+    net)       mod_net ${rest[@]+"${rest[@]}"} ;;
     modules)   module_registry ;;
     menu)      show_banner; menu ;;
     *)         err "unknown command: ${cmd_name}"; usage; return 1 ;;

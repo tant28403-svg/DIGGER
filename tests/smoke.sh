@@ -327,12 +327,24 @@ run social --help
 expect_match "social has its own usage" 'digger.sh social'
 
 # ---------------------------------------------------------------------------
-section "module: stubs"
+section "module: net"
 
-for m in net; do
-  run "$m" some-target
-  expect_match "stub '$m' reports not implemented" 'not implemented yet'
-done
+run net 8.8.8.8 < /dev/null
+expect_match "net prints a header" 'NETWORK PATH'
+expect_match "net shows the trace settings" 'max hops'
+expect_status "net behaves without consent" 0
+
+run net 8.8.8.8 --max-hops 7
+expect_match "net honours --max-hops" 'max hops    : 7'
+
+run net 'bad host!!'
+expect_match "net rejects garbage" 'invalid target'
+
+run net this-does-not-exist-xyz123.invalid
+expect_match "net fails cleanly on an unknown host" 'could not resolve'
+
+run net --help
+expect_match "net has its own usage" 'digger.sh net'
 
 # ---------------------------------------------------------------------------
 printf '\n%s%d passed%s, %s%d failed%s, %s%d skipped%s\n' \
