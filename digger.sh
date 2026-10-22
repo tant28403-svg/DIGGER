@@ -314,7 +314,7 @@ http_get() {
       --max-time "$timeout" --connect-timeout "$timeout" \
       -H "User-Agent: $USER_AGENT" \
       -H 'Accept: */*' \
-      -- "$url" 2>/dev/null)
+      -- "$url" 2>/dev/null </dev/null)
     rc=$?
     set -e
     if (( rc == 0 )) && [[ -n "$out" ]]; then
@@ -334,7 +334,7 @@ http_head() {
     set +e
     out=$(curl -sS -L -I --max-time "$timeout" --connect-timeout "$timeout" \
       -H "User-Agent: $USER_AGENT" \
-      -- "$url" 2>/dev/null)
+      -- "$url" 2>/dev/null </dev/null)
     rc=$?
     set -e
     if (( rc == 0 )) && [[ -n "$out" ]]; then
@@ -1899,6 +1899,619 @@ mod_intel() {
   return 0
 }
 
+read -r -d '' PY_JSON_MAP <<'PYEOF' || true
+import json, sys
+try:
+    sys.stdout.reconfigure(newline='\n')
+except Exception:
+    pass
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+field = sys.argv[1]
+items = data if isinstance(data, list) else [data]
+for item in items:
+    if not isinstance(item, dict) or field not in item:
+        continue
+    value = item[field]
+    if isinstance(value, list):
+        for v in value:
+            if isinstance(v, (dict, list)):
+                print(json.dumps(v))
+            else:
+                for line in str(v).split('\n'):
+                    if line:
+                        print(line)
+    elif isinstance(value, (dict, list)):
+        print(json.dumps(value))
+    else:
+        for line in str(value).split('\n'):
+            if line:
+                print(line)
+PYEOF
+
+# Print one field for every object of a JSON array, one value per line.
+json_map() {
+  local json="$1" field="$2"
+  [[ -z "$json" ]] && return 1
+  if have jq; then
+    printf '%s' "$json" | jq -r --arg f "$field" '.[]? | .[$f]? | if type == "array" then .[] else . end' 2>/dev/null
+    return $?
+  fi
+  printf '%s' "$json" | "$PY" -c "$PY_JSON_MAP" "$field" 2>/dev/null
+}
+
+# Normalise a candidate name and make sure it belongs to the target domain.
+sub_clean_name() {
+  local n="$1" domain="$2"
+  n="${n,,}"
+  n="${n//$'\r'/}"
+  n="${n//$'\n'/}"
+  n="${n%.}"
+  n="${n#\*.}"
+  n="${n#\*}"
+  [[ -z "$n" ]] && return 1
+  [[ "$n" == "$domain" ]] && return 1
+  [[ "$n" == *".${domain}" ]] || return 1
+  is_hostname "$n" || return 1
+  # Sets a variable instead of printing: this runs for every candidate and a
+  # fork per call would dominate the runtime.
+  SUB_CLEAN_RESULT="$n"
+  return 0
+}
+
+# --- Module 8: Subdomain Finder --------------------------------------------
+# Core labels the pattern generator works on.
+SUB_CORE_LABELS=(
+  www web api dev test stage staging qa uat prod demo sandbox preview
+  mail smtp ftp ns ns1 ns2 mx cpanel whm admin administrator root login
+  dashboard portal intranet extranet internal vpn remote ssh git gitlab
+  jenkins ci cd build deploy release monitor status
+  help support docs doc wiki blog shop store payment invoice
+  auth sso oauth identity gateway proxy db database redis elastic
+  search static assets cdn media img images files upload downloads mobile
+  app apps api1 api2 api3 server host node worker cloud
+)
+SUB_ENV_WORDS=(dev test staging qa prod demo)
+
+# Candidate names produced by the pattern generator: label-env for every core
+# label plus env-label for the labels that usually carry an environment.
+sub_gen_patterns() {
+  local domain="$1" label env
+  for label in "${SUB_CORE_LABELS[@]}"; do
+    for env in "${SUB_ENV_WORDS[@]}"; do
+      [[ "$env" == "$label" ]] && continue
+      printf '%s-%s.%s\n' "$label" "$env" "$domain"
+    done
+  done
+  for label in www api app admin auth mail db db1 git vpn shop cdn ns; do
+    for env in "${SUB_ENV_WORDS[@]}"; do
+      printf '%s-%s.%s\n' "$env" "$label" "$domain"
+    done
+  done
+}
+
+# Names from the certificate transparency logs. Both logs are queried at the
+# same time, they are slow and independent of each other.
+sub_collect_ct() {
+  local domain="$1"
+
+  (
+    local body
+    body=$(http_get "https://crt.sh/?q=%25.${domain}&output=json&exclude=expired" 20 1) || body=''
+    if [[ -n "$body" && "$body" == \[* ]]; then
+      json_map "$body" 'name_value' 2>/dev/null || true
+      json_map "$body" 'common_name' 2>/dev/null || true
+    fi
+  ) &
+
+  (
+    local body
+    body=$(http_get "https://api.certspotter.com/v1/issuances?domain=${domain}&include_subdomains=true&expand=dns_names" 20 1) || body=''
+    if [[ -n "$body" && "$body" == \[* ]]; then
+      json_map "$body" 'dns_names' 2>/dev/null || true
+    fi
+  ) &
+
+  wait
+}
+
+# Names from subdomain.center, a keyless passive aggregator.
+sub_collect_agg() {
+  local domain="$1" body
+  body=$(http_get "https://api.subdomain.center/?domain=${domain}" 25 1) || body=''
+  if [[ -n "$body" && "$body" == \[* ]]; then
+    json_get "$body" '.[]' 2>/dev/null || true
+  fi
+}
+
+# Names and addresses from the passive DNS sources.
+sub_collect_pdns() {
+  local domain="$1"
+
+  (
+    local body
+    body=$(http_get "https://api.mnemonic.no/pdns/v3/${domain}" 20 1) || body=''
+    if [[ -n "$body" && "$body" == \{* ]] && [[ -n "$PY" ]]; then
+      printf '%s' "$body" | "$PY" -c "
+import json, sys
+try:
+    sys.stdout.reconfigure(newline='\n')
+except Exception:
+    pass
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for row in (data.get('data') or []):
+    q = (row.get('query') or '').lower()
+    a = (row.get('answer') or '').lower()
+    if q and a:
+        print(q + '\t' + a)
+" 2>/dev/null || true
+    fi
+  ) &
+
+  (
+    local body
+    body=$(http_get "https://api.hackertarget.com/hostsearch/?q=${domain}" 12 1) || body=''
+    if [[ -n "$body" ]] && printf '%s' "$body" | grep -qiE '^[a-z0-9.-]+,[0-9a-f.:]+$'; then
+      printf '%s\n' "$body" | tr 'A-Z' 'a-z' | grep -E '^[a-z0-9._-]+,[0-9a-f.:]+$' || true
+    fi
+  ) &
+
+  wait
+}
+
+# Resolve a batch of names with dig in one go.
+sub_resolve_dig_chunk() {
+  local -a args=()
+  local n
+  for n in "$@"; do
+    args+=("$n" A)
+  done
+  (( ${#args[@]} == 0 )) && return 0
+
+  local answers
+  answers=$(dig +noall +answer +time=4 +tries=1 "${args[@]}" 2>/dev/null | awk '
+    {
+      owner = tolower($1); sub(/\.$/, "", owner)
+      type  = tolower($4)
+      if (type == "a")          printf "A\t%s\t%s\n", owner, $5
+      else if (type == "aaaa")  printf "6\t%s\t%s\n", owner, $5
+      else if (type == "cname") { data = tolower($5); sub(/\.$/, "", data); printf "C\t%s\t%s\n", owner, data }
+    }' | sort -u) || answers=''
+
+  # CNAME chains: build owner -> target and owner -> address maps, then walk
+  # each queried name until an address is found.
+  local -A a_map=() c_map=()
+  local t owner val
+  while IFS=$'\t' read -r t owner val; do
+    [[ -z "$t" ]] && continue
+    case "$t" in
+      A|6) a_map["$owner"]="$val" ;;
+      C)   c_map["$owner"]="$val" ;;
+    esac
+  done <<< "$answers"
+
+  local cur hops
+  for n in "$@"; do
+    n="${n%.}"
+    cur="$n"
+    hops=0
+    while (( hops < 8 )); do
+      if [[ -n "${a_map[$cur]:-}" ]]; then
+        printf '%s\t%s\n' "$n" "${a_map[$cur]}"
+        break
+      fi
+      cur="${c_map[$cur]:-}"
+      [[ -z "$cur" ]] && break
+      hops=$(( hops + 1 ))
+    done
+  done
+}
+
+# Pick the first address out of a DNS over HTTPS answer.
+sub_doh_pick_ip() {
+  local json="$1" line
+  [[ -z "$json" ]] && return 1
+  while IFS= read -r line; do
+    if is_ipv4 "$line" || is_ipv6 "$line"; then
+      printf '%s' "$line"
+      return 0
+    fi
+  done < <(json_get "$json" '.Answer[].data' 2>/dev/null || true)
+  return 1
+}
+
+# Resolve a single name over DNS over HTTPS.
+sub_resolve_doh_one() {
+  local name="$1" json ip
+  json=$(http_get "https://dns.google/resolve?name=${name}&type=A" 8 1) || json=''
+  ip=$(sub_doh_pick_ip "$json" || true)
+  [[ -z "$ip" ]] && return 0
+  printf '%s\t%s\n' "$name" "$ip"
+}
+
+# Resolve every candidate name. Reads names on stdin, prints "name<TAB>ip".
+sub_resolve_all() {
+  local threads="${1:-10}"
+  local -a names=()
+  local n
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    names+=("$n")
+  done
+  (( ${#names[@]} == 0 )) && return 0
+
+  if have dig; then
+    # dig answers many questions in one run, so the work is split into chunks
+    # that are queried at the same time.
+    local -a chunk=()
+    local -a pids=()
+    for n in "${names[@]}"; do
+      chunk+=("$n")
+      if (( ${#chunk[@]} >= 120 )); then
+        sub_resolve_dig_chunk "${chunk[@]}" &
+        pids+=($!)
+        chunk=()
+        if (( ${#pids[@]} >= threads )); then
+          wait "${pids[0]}" 2>/dev/null || true
+          pids=("${pids[@]:1}")
+        fi
+      fi
+    done
+    if (( ${#chunk[@]} > 0 )); then
+      sub_resolve_dig_chunk "${chunk[@]}" &
+      pids+=($!)
+    fi
+    wait 2>/dev/null || true
+    return 0
+  fi
+
+  # No dig, fall back to DNS over HTTPS. One request per name, so keep the
+  # number of parallel workers small and the request count sane.
+  local -a pids=()
+  for n in "${names[@]}"; do
+    sub_resolve_doh_one "$n" &
+    pids+=($!)
+    if (( ${#pids[@]} >= threads )); then
+      wait "${pids[0]}" 2>/dev/null || true
+      pids=("${pids[@]:1}")
+    fi
+  done
+  wait 2>/dev/null || true
+}
+
+# Does the domain answer for a name that cannot exist?
+sub_check_wildcard() {
+  local domain="$1" probe out ip line
+  probe="digger-wildcard-$$-${RANDOM}-${RANDOM}.${domain}"
+  out=$(resolve_host "$probe" || true)
+  [[ -z "$out" ]] && return 1
+  ip=''
+  while IFS= read -r line; do
+    if is_ipv4 "$line" || is_ipv6 "$line"; then
+      ip="$line"
+      break
+    fi
+  done <<< "$out"
+  [[ -z "$ip" ]] && ip="$out"
+  printf '%s' "$ip"
+}
+
+mod_subdomains() {
+  local target='' wordlist='' use_ct=1 use_pdns=1 use_wl=1 use_pattern=1 threads=10 limit=0 resolve=1
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --wordlist)     wordlist="${2:-}"; shift 2 || shift ;;
+      --no-ct)        use_ct=0; shift ;;
+      --no-pdns)      use_pdns=0; shift ;;
+      --no-wordlist)  use_wl=0; shift ;;
+      --no-pattern)   use_pattern=0; shift ;;
+      --no-resolve)   resolve=0; shift ;;
+      --threads)      threads="${2:-10}"; shift 2 || shift ;;
+      --limit)        limit="${2:-0}"; shift 2 || shift ;;
+      -h|--help)
+        printf 'usage: digger.sh subdomains <domain> [--wordlist FILE] [--no-ct] [--no-pdns] [--no-wordlist] [--no-pattern] [--no-resolve] [--threads N] [--limit N]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "SUBDOMAIN FINDER"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Domain")
+  fi
+  target="${target// /}"
+  target="${target,,}"
+  target="${target#https://}"
+  target="${target#http://}"
+  target="${target%%/*}"
+  target="${target%%:*}"
+
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+  if ! is_hostname "$target"; then
+    err "invalid domain: ${target}"
+    return 1
+  fi
+
+  info "Target: ${C_BOLD}${target}${C_RESET}"
+
+  # --- sources -----------------------------------------------------------
+  if [[ -z "$wordlist" ]]; then
+    wordlist=$(wordlist_file "subdomains.txt" || true)
+  fi
+
+  printf '\n%sSources%s\n' "$C_BOLD" "$C_RESET"
+  (( use_ct ))   && printf '  certificate transparency : crt.sh, certspotter\n'
+  (( use_pdns )) && printf '  passive DNS               : mnemonic.no, hackertarget\n'
+  (( use_ct ))   && printf '  passive aggregator        : subdomain.center\n'
+  if (( use_wl )); then
+    if [[ -n "$wordlist" && -f "$wordlist" ]]; then
+      printf '  wordlist                  : %s (%s labels)\n' "$wordlist" "$(grep -cvE '^[[:space:]]*(#|$)' "$wordlist" || true)"
+    else
+      printf '  wordlist                  : %snot found%s\n' "$C_DIM" "$C_RESET"
+      use_wl=0
+    fi
+  fi
+  (( use_pattern )) && printf '  pattern generator         : %s core labels x %s environments\n' "${#SUB_CORE_LABELS[@]}" "${#SUB_ENV_WORDS[@]}"
+  printf '  wildcard filter           : enabled\n'
+
+  # --- passive collection -------------------------------------------------
+  local -a ct_names=() pdns_names=() wl_names=() pat_names=()
+  local raw='' n
+
+  if (( use_ct || use_pdns )); then
+    printf '  %s[+]%s querying passive sources in parallel...\n' "$C_DIM" "$C_RESET"
+    raw=$(
+      { (( use_ct )) && sub_collect_ct "$target"; } &
+      { (( use_pdns )) && sub_collect_pdns "$target"; } &
+      { (( use_ct )) && sub_collect_agg "$target"; } &
+      wait
+    )
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      if [[ "$line" == *$'\t'* ]]; then
+        pdns_names+=("$line")
+      else
+        ct_names+=("$line")
+      fi
+    done <<< "$raw"
+    printf '  %s[+]%s passive sources: %s names, %s with an address\n' \
+      "$C_GREEN" "$C_RESET" "${#ct_names[@]}" "${#pdns_names[@]}"
+    if (( ${#ct_names[@]} == 0 && ${#pdns_names[@]} == 0 )); then
+      printf '  %s[!]%s every passive source came back empty (they rate limit hard)\n' "$C_YELLOW" "$C_RESET"
+      printf '      %stry again in a minute, or lean on the wordlist%s\n' "$C_DIM" "$C_RESET"
+    fi
+  fi
+
+  if (( use_wl )) && [[ -n "$wordlist" && -f "$wordlist" ]]; then
+    printf '  %s[+]%s loading the wordlist...\n' "$C_DIM" "$C_RESET"
+    while IFS= read -r label; do
+      label="${label%$'\r'}"
+      [[ -z "$label" ]] && continue
+      [[ "$label" == \#* ]] && continue
+      [[ "$label" == *.* ]] && continue
+      wl_names+=("${label}.${target}")
+    done < "$wordlist"
+    printf '  %s[+]%s wordlist: %s candidates\n' "$C_GREEN" "$C_RESET" "${#wl_names[@]}"
+  fi
+
+  if (( use_pattern )); then
+    printf '  %s[+]%s generating patterns...\n' "$C_DIM" "$C_RESET"
+    while IFS= read -r n; do
+      [[ -z "$n" ]] && continue
+      pat_names+=("$n")
+    done < <(sub_gen_patterns "$target")
+    printf '  %s[+]%s patterns: %s candidates\n' "$C_GREEN" "$C_RESET" "${#pat_names[@]}"
+  fi
+
+  # --- wildcard ----------------------------------------------------------
+  local wildcard=''
+  wildcard=$(sub_check_wildcard "$target" || true)
+  if [[ -n "$wildcard" ]]; then
+    printf '  %s[!]%s wildcard DNS detected, every name resolves to %s\n' "$C_YELLOW" "$C_RESET" "$wildcard"
+    printf '      %sresults from the wordlist and the generator are unreliable%s\n' "$C_DIM" "$C_RESET"
+  else
+    printf '  %s[+]%s no wildcard DNS record\n' "$C_GREEN" "$C_RESET"
+  fi
+
+  # --- merge candidates ---------------------------------------------------
+  local -A seen=() from_ct=() from_pdns=() from_wl=() from_pat=()
+  local cn
+
+  for n in ${ct_names[@]+"${ct_names[@]}"}; do
+    sub_clean_name "$n" "$target" || continue
+    cn="$SUB_CLEAN_RESULT"
+    from_ct["$cn"]=1
+  done
+  for n in ${pdns_names[@]+"${pdns_names[@]}"}; do
+    n="${n%%$'\t'*}"
+    sub_clean_name "$n" "$target" || continue
+    cn="$SUB_CLEAN_RESULT"
+    from_pdns["$cn"]=1
+  done
+  for n in ${wl_names[@]+"${wl_names[@]}"}; do
+    sub_clean_name "$n" "$target" || continue
+    cn="$SUB_CLEAN_RESULT"
+    from_wl["$cn"]=1
+  done
+  for n in ${pat_names[@]+"${pat_names[@]}"}; do
+    sub_clean_name "$n" "$target" || continue
+    cn="$SUB_CLEAN_RESULT"
+    from_pat["$cn"]=1
+  done
+
+  for n in "${!from_ct[@]}"; do seen["$n"]=1; done
+  for n in "${!from_pdns[@]}"; do seen["$n"]=1; done
+  for n in "${!from_wl[@]}"; do seen["$n"]=1; done
+  for n in "${!from_pat[@]}"; do seen["$n"]=1; done
+
+  # Display order is alphabetical.
+  local -a candidates=()
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    candidates+=("$n")
+  done < <(printf '%s\n' "${!seen[@]}" | sort)
+
+  # Resolution order matters: names seen in a passive source are always
+  # checked, the brute force part follows the wordlist order so a truncated
+  # run still looks at the most likely names first.
+  local -a passive=() brute=()
+  for n in ${candidates[@]+"${candidates[@]}"}; do
+    if [[ -n "${from_ct[$n]:-}" || -n "${from_pdns[$n]:-}" ]]; then
+      passive+=("$n")
+    fi
+  done
+  for n in ${wl_names[@]+"${wl_names[@]}"}; do
+    sub_clean_name "$n" "$target" || continue
+    n="$SUB_CLEAN_RESULT"
+    [[ -n "${from_ct[$n]:-}" || -n "${from_pdns[$n]:-}" ]] && continue
+    brute+=("$n")
+  done
+  for n in ${pat_names[@]+"${pat_names[@]}"}; do
+    sub_clean_name "$n" "$target" || continue
+    n="$SUB_CLEAN_RESULT"
+    [[ -n "${from_ct[$n]:-}" || -n "${from_pdns[$n]:-}" ]] && continue
+    brute+=("$n")
+  done
+
+  printf '\n%sCandidates%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %s unique names, %s from passive sources\n' "${#candidates[@]}" "${#passive[@]}"
+
+  # --- resolution ---------------------------------------------------------
+  local -A resolved=()
+  if (( resolve )); then
+    local resolver='DNS over HTTPS (dns.google)'
+    local budget="$limit"
+    if have dig; then
+      resolver='dig (system resolver)'
+      (( budget > 0 )) || budget=1500
+    else
+      (( budget > 0 )) || budget=150
+    fi
+
+    local -a todo=("${passive[@]+"${passive[@]}"}")
+    if (( ${#brute[@]} > budget )); then
+      todo+=("${brute[@]:0:budget}")
+      printf '  %s[!]%s brute force limited to %s names, raise it with --limit\n' "$C_YELLOW" "$C_RESET" "$budget"
+    else
+      todo+=("${brute[@]+"${brute[@]}"}")
+    fi
+
+    printf '  %s[+]%s resolving %s names with %s...\n' "$C_DIM" "$C_RESET" "${#todo[@]}" "$resolver"
+    raw=$(printf '%s\n' ${todo[@]+"${todo[@]}"} | sub_resolve_all "$threads")
+    while IFS=$'\t' read -r n ip; do
+      [[ -z "$n" ]] && continue
+      resolved["$n"]="$ip"
+    done <<< "$raw"
+    printf '  %s[+]%s %s names resolve\n' "$C_GREEN" "$C_RESET" "${#resolved[@]}"
+  fi
+
+  # --- cross check with a second resolver ---------------------------------
+  local -A confirmed=()
+  if (( resolve )) && (( ${#resolved[@]} > 0 )); then
+    local -a sample=()
+    for n in "${!resolved[@]}"; do
+      sample+=("$n")
+    done
+    if (( ${#sample[@]} > 25 )); then
+      sample=("${sample[@]:0:25}")
+    fi
+    local cname cip cjson
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      cname="${line%%$'\t'*}"
+      cip="${line#*$'\t'}"
+      confirmed["$cname"]="$cip"
+    done < <(printf '%s\n' ${sample[@]+"${sample[@]}"} | while IFS= read -r x; do
+      cjson=$(http_get "https://cloudflare-dns.com/dns-query?name=${x}&type=A" 8 1) || cjson=''
+      cip=$(sub_doh_pick_ip "$cjson" || true)
+      [[ -z "$cip" ]] && continue
+      printf '%s\t%s\n' "$x" "$cip"
+    done)
+  fi
+
+  # --- classification -----------------------------------------------------
+  local -a high=() medium=() low=()
+  local source ip conf
+  for n in ${candidates[@]+"${candidates[@]}"}; do
+    ip="${resolved[$n]:-}"
+    source=''
+    [[ -n "${from_ct[$n]:-}" ]] && source="${source}ct "
+    [[ -n "${from_pdns[$n]:-}" ]] && source="${source}pdns "
+    [[ -n "${from_wl[$n]:-}" ]] && source="${source}wordlist "
+    [[ -n "${from_pat[$n]:-}" ]] && source="${source}pattern "
+    source="${source% }"
+
+    conf=''
+    [[ -n "${confirmed[$n]:-}" ]] && conf=' (2 resolvers)'
+
+    if [[ -n "$ip" ]]; then
+      if [[ -n "${from_ct[$n]:-}" || -n "${from_pdns[$n]:-}" ]]; then
+        high+=("${ip}|${n}|${source}${conf}")
+      else
+        medium+=("${ip}|${n}|${source}${conf}")
+      fi
+    elif [[ -n "${from_ct[$n]:-}" || -n "${from_pdns[$n]:-}" ]]; then
+      low+=("-|${n}|${source}")
+    fi
+  done
+
+  printf '\n%sResults%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %s high, %s medium, %s low confidence\n' "${#high[@]}" "${#medium[@]}" "${#low[@]}"
+
+  local group title colour entry c s t p
+  local -a entries=()
+  for group in high medium low; do
+    entries=()
+    case "$group" in
+      high)   title="HIGH CONFIDENCE";   colour="$C_GREEN";  entries=(${high[@]+"${high[@]}"}) ;;
+      medium) title="MEDIUM CONFIDENCE"; colour="$C_YELLOW"; entries=(${medium[@]+"${medium[@]}"}) ;;
+      low)    title="LOW CONFIDENCE";    colour="$C_DIM";    entries=(${low[@]+"${low[@]}"}) ;;
+    esac
+    (( ${#entries[@]} == 0 )) && continue
+    printf '\n%s%s%s (%s)\n' "$colour" "$title" "$C_RESET" "${#entries[@]}"
+    for entry in "${entries[@]}"; do
+      IFS='|' read -r c s t p <<< "$entry"
+      printf '  %s%-15s%s %-44s %s\n' "$colour" "$c" "$C_RESET" "$s" "$t"
+    done
+  done
+
+  # --- summary ------------------------------------------------------------
+  local srcs=''
+  (( use_ct )) && srcs="${srcs}crt.sh, certspotter, subdomain.center, "
+  (( use_pdns )) && srcs="${srcs}mnemonic.no, hackertarget, "
+  srcs="${srcs%, }"
+
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Sources     : %s\n' "$srcs"
+  if have dig; then
+    printf '  Resolver    : dig (system resolver)\n'
+  else
+    printf '  Resolver    : DNS over HTTPS (dns.google)\n'
+  fi
+  if [[ -n "$wildcard" ]]; then
+    printf '  Wildcard    : %s (every name resolves)\n' "$wildcard"
+  else
+    printf '  Wildcard    : none\n'
+  fi
+  printf '  High        : %s\n' "${#high[@]}"
+  printf '  Medium      : %s\n' "${#medium[@]}"
+  printf '  Low         : %s\n' "${#low[@]}"
+  return 0
+}
+
 mod_info() {
   local target="${1:-}"
 
@@ -2502,7 +3115,7 @@ menu() {
       4) pending "scan" 16 ;;
       5) pending "hosts" 15 ;;
       7) mod_links ;;
-      8) pending "subdomains" 14 ;;
+      8) mod_subdomains ;;
       9) pending "archive" 9 ;;
       10) mod_paths ;;
       11) mod_tls ;;
@@ -2553,7 +3166,7 @@ main() {
     scan)      pending "scan" 16 ;;
     hosts)     pending "hosts" 15 ;;
     links)     mod_links ${rest[@]+"${rest[@]}"} ;;
-    subdomains) pending "subdomains" 14 ;;
+    subdomains) mod_subdomains ${rest[@]+"${rest[@]}"} ;;
     archive)   pending "archive" 9 ;;
     paths)     mod_paths ${rest[@]+"${rest[@]}"} ;;
     tls)       mod_tls ${rest[@]+"${rest[@]}"} ;;

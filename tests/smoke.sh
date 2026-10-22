@@ -189,9 +189,30 @@ run intel 'not a target!!'
 expect_match "intel rejects garbage" 'invalid target'
 
 # ---------------------------------------------------------------------------
+section "module: subdomains"
+
+run subdomains 'not a domain!!'
+expect_match "subdomains rejects garbage" 'invalid domain'
+
+run subdomains example.com --no-ct --no-pdns --no-wordlist --no-pattern
+expect_match "subdomains lists its sources" 'Sources'
+expect_match "subdomains reports candidates" 'Candidates'
+expect_match "subdomains prints a summary" 'Summary'
+expect_status "subdomains with everything disabled exits 0" 0
+
+run subdomains example.com --no-ct --no-pdns --limit 3
+expect_match "subdomains resolves a wordlist sample" 'resolving [0-9]+ names'
+expect_match "subdomains reports confidence tiers" 'CONFIDENCE|Results'
+expect_status "subdomains wordlist run exits 0" 0
+
+run subdomains example.com --no-wordlist --no-pattern --no-resolve
+expect_match "subdomains queries the passive sources" 'passive sources'
+expect_status "subdomains passive run exits 0" 0
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in scan hosts subdomains archive secrets dorks social net; do
+for m in scan hosts archive secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done
