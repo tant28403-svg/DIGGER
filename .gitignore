@@ -1,0 +1,15 @@
+# editor / OS
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# local scratch
+results/
+*.log
+tmp/
+
+# dependencies
+node_modules/
+venv/
+.venv/
