@@ -177,9 +177,21 @@ run cdn 'not a host!!'
 expect_match "cdn rejects garbage" 'invalid host'
 
 # ---------------------------------------------------------------------------
+section "module: intel"
+
+run intel 8.8.8.8
+expect_match "intel reports DNS blacklists" 'DNS blacklists'
+expect_match "intel reports IP blacklists" 'IP blacklists'
+expect_match "intel prints a summary" 'Summary'
+expect_status "intel exits 0" 0
+
+run intel 'not a target!!'
+expect_match "intel rejects garbage" 'invalid target'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in scan hosts subdomains archive intel secrets dorks social net; do
+for m in scan hosts subdomains archive secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done

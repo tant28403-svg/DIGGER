@@ -1673,7 +1673,232 @@ strict-transport-security"
   return 0
 }
 
-# --- Module 2: Info IP and Site -------------------------------------------
+# --- Module 13: Threat Intelligence ----------------------------------------
+DNSBL_ZONES=(
+  "zen.spamhaus.org"
+  "bl.spamcop.net"
+  "b.barracudacentral.org"
+  "psbl.surriel.com"
+  "dnsbl.sorbs.net"
+  "dnsbl-1.uceprotect.net"
+)
+
+# Look a host up in a DNS blacklist.
+#   0 = listed (the return code is printed)
+#   1 = not listed
+#   2 = skipped (IPv6 or no resolver)
+dnsbl_lookup() {
+  local ip="$1" zone="$2" result=''
+  if ! is_ipv4 "$ip"; then
+    return 2
+  fi
+  local rev
+  rev=$(printf '%s' "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')
+  result=$(dns_query "${rev}.${zone}" A 2>/dev/null | head -n1 || true)
+  [[ -z "$result" ]] && return 1
+  printf '%s' "$result"
+  return 0
+}
+
+# Turn a DNSBL return code into something readable.
+dnsbl_meaning() {
+  local code="$1"
+  case "$code" in
+    127.255.255.252) printf 'query refused, public resolver blocked' ;;
+    127.255.255.254) printf 'query refused, resolver is blocked' ;;
+    127.255.255.255) printf 'query refused' ;;
+    127.0.0.2|127.0.0.2*) printf 'listed' ;;
+    127.0.0.*)        printf 'listed (code %s)' "${code##*.}" ;;
+    *)                printf 'listed (code %s)' "$code" ;;
+  esac
+}
+
+mod_intel() {
+  local target=''
+
+  while (( $# > 0 )); do
+    case "$1" in
+      -h|--help)
+        printf 'usage: digger.sh intel <ip|domain|url>\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "THREAT INTELLIGENCE"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "IP address, domain or URL")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+
+  # A URL is reduced to its host.
+  if [[ "$target" == *"://"* ]]; then
+    target="${target#*://}"
+    target="${target%%/*}"
+  fi
+  target="${target,,}"
+
+  local is_domain=0 ip=''
+  if is_ip "$target"; then
+    ip="$target"
+  elif is_hostname "$target"; then
+    is_domain=1
+    ip=$(resolve_host "$target" || true)
+  else
+    err "invalid target: ${target}"
+    return 1
+  fi
+
+  info "Target: ${C_BOLD}${target}${C_RESET}"
+  if (( is_domain )) && [[ -n "$ip" ]]; then
+    printf '  Resolves to: %s\n' "$ip"
+  fi
+
+  local -a findings=()
+  local listed=0 refused=0 checked=0
+
+  # --- DNS blacklists -----------------------------------------------------
+  printf '\n%sDNS blacklists%s\n' "$C_BOLD" "$C_RESET"
+  if [[ -z "$ip" ]]; then
+    printf '  %s[!]%s the host does not resolve, skipping DNS blacklists\n' "$C_YELLOW" "$C_RESET"
+  else
+    local zone code rc meaning
+    for zone in "${DNSBL_ZONES[@]}"; do
+      rc=0
+      code=$(dnsbl_lookup "$ip" "$zone") || rc=$?
+      case "$rc" in
+        0)
+          checked=$((checked + 1))
+          meaning=$(dnsbl_meaning "$code")
+          if [[ "$meaning" == listed* ]]; then
+            printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "$zone" "$meaning"
+            findings+=("listed on ${zone} (${code})")
+            listed=$((listed + 1))
+          else
+            printf '  %s[-]%s %-30s %s\n' "$C_DIM" "$C_RESET" "$zone" "$meaning"
+            refused=$((refused + 1))
+          fi
+          ;;
+        1)
+          checked=$((checked + 1))
+          printf '  %s[+]%s %-30s not listed\n' "$C_GREEN" "$C_RESET" "$zone"
+          ;;
+        *)
+          printf '  %s[-]%s %-30s skipped\n' "$C_DIM" "$C_RESET" "$zone"
+          ;;
+      esac
+    done
+  fi
+
+  # --- IP blacklists ------------------------------------------------------
+  printf '\n%sIP blacklists%s\n' "$C_BOLD" "$C_RESET"
+  if [[ -z "$ip" ]]; then
+    printf '  %s[!]%s no address to check\n' "$C_YELLOW" "$C_RESET"
+  else
+    local body
+
+    body=$(http_get "https://api.blocklist.de/api.php?ip=${ip}" "$HTTP_TIMEOUT" 1) || body=''
+    checked=$((checked + 1))
+    if [[ -n "$body" ]]; then
+      # the endpoint answers with a small HTML fragment such as
+      # "attacks: 3<br />reports: 12<br />"
+      local attacks='0' reports='0'
+      attacks=$(printf '%s' "$body" | grep -oiE 'attacks:[^<0-9]*[0-9]+' | grep -oE '[0-9]+$' || true)
+      reports=$(printf '%s' "$body" | grep -oiE 'reports:[^<0-9]*[0-9]+' | grep -oE '[0-9]+$' || true)
+      [[ "$attacks" =~ ^[0-9]+$ ]] || attacks=0
+      [[ "$reports" =~ ^[0-9]+$ ]] || reports=0
+      if (( attacks > 0 || reports > 0 )); then
+        printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "blocklist.de" "listed (${attacks} attacks, ${reports} reports)"
+        findings+=("listed on blocklist.de (${attacks} attacks, ${reports} reports)")
+        listed=$((listed + 1))
+      elif printf '%s' "$body" | grep -qE '127\.0\.0\.[0-9]+'; then
+        printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "blocklist.de" "listed"
+        findings+=("listed on blocklist.de")
+        listed=$((listed + 1))
+      elif printf '%s' "$body" | grep -qi 'no address'; then
+        printf '  %s[+]%s %-30s not listed\n' "$C_GREEN" "$C_RESET" "blocklist.de"
+      else
+        printf '  %s[+]%s %-30s not listed\n' "$C_GREEN" "$C_RESET" "blocklist.de"
+      fi
+    else
+      printf '  %s[-]%s %-30s source unavailable\n' "$C_DIM" "$C_RESET" "blocklist.de"
+    fi
+
+    body=$(http_get "https://cinsscore.com/list/ci-badguys.txt" 25 1) || body=''
+    checked=$((checked + 1))
+    if [[ -n "$body" ]]; then
+      if printf '%s\n' "$body" | grep -qE "(^|[^0-9.])${ip}([^0-9.]|$)"; then
+        printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "cinsscore.com" "listed"
+        findings+=("listed on cinsscore.com")
+        listed=$((listed + 1))
+      else
+        printf '  %s[+]%s %-30s not listed\n' "$C_GREEN" "$C_RESET" "cinsscore.com"
+      fi
+    else
+      printf '  %s[-]%s %-30s source unavailable\n' "$C_DIM" "$C_RESET" "cinsscore.com"
+    fi
+
+    body=$(http_get "https://check.torproject.org/torbulkexitlist" 25 1) || body=''
+    checked=$((checked + 1))
+    if [[ -n "$body" ]]; then
+      if printf '%s\n' "$body" | grep -qE "(^|[^0-9.])${ip}([^0-9.]|$)"; then
+        printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "tor exit nodes" "listed"
+        findings+=("listed as a Tor exit node")
+        listed=$((listed + 1))
+      else
+        printf '  %s[+]%s %-30s not listed\n' "$C_GREEN" "$C_RESET" "tor exit nodes"
+      fi
+    else
+      printf '  %s[-]%s %-30s source unavailable\n' "$C_DIM" "$C_RESET" "tor exit nodes"
+    fi
+  fi
+
+  # --- phishing feeds -----------------------------------------------------
+  printf '\n%sPhishing feeds%s\n' "$C_BOLD" "$C_RESET"
+  if (( is_domain == 0 )); then
+    printf '  %s[-]%s domain feeds only apply to a hostname\n' "$C_DIM" "$C_RESET"
+  else
+    local feed
+    feed=$(http_get "https://openphish.com/feed.txt" 25 1) || feed=''
+    checked=$((checked + 1))
+    if [[ -n "$feed" ]]; then
+      if printf '%s\n' "$feed" | grep -qiF "$target"; then
+        printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "openphish.com" "listed"
+        findings+=("listed on openphish.com")
+        listed=$((listed + 1))
+      else
+        printf '  %s[+]%s %-30s not listed\n' "$C_GREEN" "$C_RESET" "openphish.com"
+      fi
+    else
+      printf '  %s[-]%s %-30s source unavailable\n' "$C_DIM" "$C_RESET" "openphish.com"
+    fi
+  fi
+
+  # --- summary ------------------------------------------------------------
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  if (( listed == 0 )); then
+    printf '  %s[+]%s no listings found across %s checks\n' "$C_GREEN" "$C_RESET" "$checked"
+  else
+    printf '  %s[!]%s %s listing(s) found:\n' "$C_RED" "$C_RESET" "$listed"
+    local f
+    for f in "${findings[@]}"; do
+      printf '      - %s\n' "$f"
+    done
+  fi
+  if (( refused > 0 )); then
+    printf '  %s[!]%s %s blacklist(s) refused the query, treat those as unknown\n' "$C_YELLOW" "$C_RESET" "$refused"
+  fi
+  return 0
+}
+
 mod_info() {
   local target="${1:-}"
 
@@ -2282,7 +2507,7 @@ menu() {
       10) mod_paths ;;
       11) mod_tls ;;
       12) mod_cdn ;;
-      13) pending "intel" 12 ;;
+      13) mod_intel ;;
       14) pending "secrets" 17 ;;
       15) pending "dorks" 18 ;;
       16) pending "social" 19 ;;
@@ -2333,7 +2558,7 @@ main() {
     paths)     mod_paths ${rest[@]+"${rest[@]}"} ;;
     tls)       mod_tls ${rest[@]+"${rest[@]}"} ;;
     cdn)       mod_cdn ${rest[@]+"${rest[@]}"} ;;
-    intel)     pending "intel" 12 ;;
+    intel)     mod_intel ${rest[@]+"${rest[@]}"} ;;
     secrets)   pending "secrets" 17 ;;
     dorks)     pending "dorks" 18 ;;
     social)    pending "social" 19 ;;
