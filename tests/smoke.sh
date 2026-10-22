@@ -104,9 +104,37 @@ run dns 'not a hostname!!'
 expect_match "dns rejects garbage target" 'invalid target'
 
 # ---------------------------------------------------------------------------
+section "module: info (IP)"
+
+run info 8.8.8.8
+expect_match "info reports location for an IP" 'Location|Country'
+expect_match "info reports allocation data" 'Allocation|RDAP|Net name'
+expect_status "info on an IP exits 0" 0
+
+# ---------------------------------------------------------------------------
+section "module: info (site)"
+
+run info example.com
+expect_match "info reports HTTP status for a site" 'Status'
+expect_match "info reports a title" 'Title'
+expect_match "info audits security headers" 'Security headers'
+expect_status "info on a site exits 0" 0
+
+# ---------------------------------------------------------------------------
+section "module: domain"
+
+run domain example.com
+expect_match "domain reports registration" 'Registration|Whois'
+expect_match "domain reports events or dates" 'Events|Creation|Expiry|Status'
+expect_status "domain exits 0" 0
+
+run domain 'not a domain!!'
+expect_match "domain rejects garbage" 'invalid domain'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in info scan hosts domain links subdomains archive paths tls cdn intel secrets dorks social net; do
+for m in scan hosts links subdomains archive paths tls cdn intel secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done
