@@ -204,6 +204,7 @@ ${C_BOLD}COMMANDS${C_RESET}
   links <url>                crawl a site and list every link it finds
   subdomains <domain>        passive subdomains, wordlist and pattern guessing
   hosts <domain|ip>          reverse hosts on an address, optional vhost probing
+  scan <host|ip>             TCP port scan (nmap -sT, or a /dev/tcp fallback)
   paths <url>                probe common paths and sensitive files
   tls <host[:port]>          certificates, protocol versions and ciphers
   cdn <domain|url>           CDN and WAF detection
@@ -2868,6 +2869,298 @@ mod_hosts() {
   return 0
 }
 
+# --- Module 4: Port Scanner ------------------------------------------------
+# Ports probed by the /dev/tcp fallback when nmap is not installed.
+SCAN_FALLBACK_PORTS=(21 22 23 25 53 80 110 111 135 139 143 161 389 443 445 465
+  500 512 513 514 515 548 587 631 636 993 995 1080 1433 1521 1723 2049 2082
+  2083 2181 2375 2376 3000 3306 3389 4444 5000 5432 5601 5672 5900 5984 6379
+  6443 7001 8000 8008 8080 8081 8443 8888 9000 9090 9200 9300 11211 27017
+  27018 50000)
+
+# Service name for a port number, from a small built-in table and then the
+# system services database.
+scan_service_name() {
+  local p="$1" name=''
+  case "$p" in
+    21) name=ftp ;; 22) name=ssh ;; 23) name=telnet ;; 25) name=smtp ;;
+    53) name=domain ;; 80) name=http ;; 110) name=pop3 ;; 111) name=rpcbind ;;
+    135) name=msrpc ;; 139) name=netbios-ssn ;; 143) name=imap ;; 161) name=snmp ;;
+    389) name=ldap ;; 443) name=https ;; 445) name=microsoft-ds ;; 465) name=smtps ;;
+    512) name=exec ;; 513) name=login ;; 514) name=shell ;; 515) name=printer ;;
+    548) name=afp ;; 587) name=submission ;; 631) name=ipp ;; 636) name=ldaps ;;
+    993) name=imaps ;; 995) name=pop3s ;; 1080) name=socks ;;
+    1433) name=ms-sql-s ;; 1521) name=oracle ;; 1723) name=pptp ;;
+    2049) name=nfs ;; 2082) name=cpanel ;; 2083) name=cpanel-ssl ;;
+    2181) name=zookeeper ;; 2375) name=docker ;; 2376) name=docker-ssl ;;
+    3000) name=node ;; 3306) name=mysql ;; 3389) name=ms-wbt-server ;;
+    4444) name=metasploit ;; 5000|8000|8008|8081|8888|9090|50000) name=http-alt ;;
+    5432) name=postgresql ;; 5601) name=kibana ;; 5672) name=amqp ;;
+    5900) name=vnc ;; 5984) name=couchdb ;; 6379) name=redis ;;
+    6443) name=k8s-api ;; 7001) name=weblogic ;; 8080) name=http-proxy ;;
+    8443) name=https-alt ;; 9200|9300) name=elasticsearch ;;
+    11211) name=memcached ;; 27017|27018) name=mongodb ;;
+  esac
+  if [[ -z "$name" ]]; then
+    name=$(getent services "$p/tcp" 2>/dev/null | awk '{print $1; exit}' || true)
+  fi
+  printf '%s' "${name:-unknown}"
+}
+
+# Expand "80,443,8000-8100" into one port per line.
+scan_expand_ports() {
+  local spec="$1"
+  local -a parts=() out=()
+  local part lo hi i
+  IFS=',' read -ra parts <<< "$spec"
+  for part in ${parts[@]+"${parts[@]}"}; do
+    part="${part// /}"
+    [[ -z "$part" ]] && continue
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      lo="${BASH_REMATCH[1]}"
+      hi="${BASH_REMATCH[2]}"
+      (( lo < 1 )) && lo=1
+      (( hi > 65535 )) && hi=65535
+      for (( i = lo; i <= hi; i++ )); do out+=("$i"); done
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      out+=("$part")
+    fi
+  done
+  (( ${#out[@]} == 0 )) && return 0
+  printf '%s\n' "${out[@]}"
+}
+
+# Can we open a TCP connection to host:port? Used only without nmap.
+scan_probe_tcp() {
+  local host="$1" port="$2" timeout="${3:-2}"
+  if have timeout; then
+    timeout "$timeout" bash -c "exec 3<>/dev/tcp/${host}/${port}" \
+      </dev/null >/dev/null 2>&1
+    return $?
+  fi
+  ( exec 3<>"/dev/tcp/${host}/${port}" ) </dev/null >/dev/null 2>&1
+}
+
+# Brute the fallback port list, keeping at most <conc> probes in flight.
+scan_fallback_all() {
+  local host="$1" timeout="$2" conc="$3"
+  shift 3
+  local -a ports=("$@") pids=()
+  local p
+  for p in ${ports[@]+"${ports[@]}"}; do
+    {
+      if scan_probe_tcp "$host" "$p" "$timeout"; then
+        printf '%s\topen\n' "$p"
+      fi
+    } &
+    pids+=($!)
+    if (( ${#pids[@]} >= conc )); then
+      wait "${pids[0]}" 2>/dev/null || true
+      pids=("${pids[@]:1}")
+    fi
+  done
+  wait 2>/dev/null || true
+}
+
+mod_scan() {
+  local target='' ports='' top=1000 conc=50 timeout=2 overall=300
+  local version=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --ports)       ports="${2:-}"; shift 2 || shift ;;
+      --top-ports)   top="${2:-1000}"; shift 2 || shift ;;
+      --fast)        top=100; shift ;;
+      --version)     version=1; shift ;;
+      --timeout)     timeout="${2:-2}"; shift 2 || shift ;;
+      --max-time)    overall="${2:-300}"; shift 2 || shift ;;
+      --concurrency) conc="${2:-50}"; shift 2 || shift ;;
+      -y|--yes)      ASSUME_YES=1; shift ;;
+      -h|--help)
+        printf 'usage: digger.sh scan <host|ip> [--ports SPEC] [--top-ports N] [--fast] [--version] [--timeout SEC] [--max-time SEC] [--concurrency N]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "PORT SCANNER"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Host or IP")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+  target="${target#*://}"
+  target="${target%%/*}"
+  target="${target%.}"
+  target="${target,,}"
+  if ! is_valid_target "$target"; then
+    err "invalid target: ${target}"
+    return 1
+  fi
+
+  [[ "$conc" =~ ^[0-9]+$ ]] && (( conc > 0 )) || conc=50
+  [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout > 0 )) || timeout=2
+  [[ "$overall" =~ ^[0-9]+$ ]] && (( overall > 0 )) || overall=300
+  [[ "$top" =~ ^[0-9]+$ ]] && (( top > 0 )) || top=1000
+
+  local ip=''
+  if is_ip "$target"; then
+    ip="$target"
+  else
+    ip=$(resolve_host "$target" || true)
+  fi
+  if [[ -z "$ip" ]]; then
+    err "could not resolve ${target}"
+    return 1
+  fi
+
+  local engine='bash'
+  have nmap && engine='nmap'
+
+  info "Target: ${C_BOLD}${target}${C_RESET} (${ip})"
+
+  local scope
+  if [[ -n "$ports" ]]; then
+    scope="ports ${ports}"
+  elif [[ "$engine" == 'nmap' ]]; then
+    scope="top ${top} TCP ports"
+  else
+    scope="${#SCAN_FALLBACK_PORTS[@]} common TCP ports"
+  fi
+
+  printf '\n%sScan%s\n' "$C_BOLD" "$C_RESET"
+  if [[ "$engine" == 'nmap' ]]; then
+    printf '  engine      : nmap, TCP connect scan (-sT, no root needed)\n'
+    (( version )) && printf '  detection   : version probing enabled\n'
+  else
+    printf '  engine      : bash /dev/tcp fallback %s(nmap not installed)%s\n' \
+      "$C_DIM" "$C_RESET"
+  fi
+  printf '  scope       : %s\n' "$scope"
+
+  if ! confirm "This sends a TCP connect scan to ${ip}. Continue?"; then
+    warn "aborted"
+    return 0
+  fi
+
+  local start elapsed out line
+  start=$(date +%s)
+  local -a open_ports=()
+  local closed=0 status=''
+
+  if [[ "$engine" == 'nmap' ]]; then
+    local -a nmap_args=(-sT -Pn -n -T4 -oG -)
+    if [[ -n "$ports" ]]; then
+      nmap_args+=(-p "$ports")
+    else
+      nmap_args+=(--top-ports "$top")
+    fi
+    if (( version )); then
+      nmap_args+=(-sV --version-light)
+    fi
+    nmap_args+=("$ip")
+
+    if have timeout; then
+      out=$(timeout "$overall" nmap "${nmap_args[@]}" 2>&1) || true
+    else
+      out=$(nmap "${nmap_args[@]}" 2>&1) || true
+    fi
+
+    local ports_field entries entry ignored
+    local pnum pstate pproto _ psvc _ pver _
+    while IFS= read -r line; do
+      case "$line" in
+        Host:*'Status:'*)
+          status=$(printf '%s' "$line" | sed -n 's/.*Status: \([A-Za-z]*\).*/\1/p')
+          ;;
+        Host:*'Ports:'*)
+          ports_field="${line#*Ports: }"
+          ports_field="${ports_field%%$'\t'*}"
+          IFS=',' read -ra entries <<< "$ports_field"
+          for entry in ${entries[@]+"${entries[@]}"}; do
+            entry="${entry# }"
+            IFS='/' read -r pnum pstate pproto _ psvc _ pver _ <<< "$entry"
+            [[ "$pstate" == 'open' ]] || continue
+            open_ports+=("${pnum}/${pproto}|${psvc:-unknown}|${pver:-}")
+          done
+          ignored=$(printf '%s' "$line" | sed -n 's/.*Ignored State: [a-z]* (\([0-9]*\)).*/\1/p')
+          [[ -n "$ignored" ]] && closed="$ignored"
+          ;;
+      esac
+    done <<< "$out"
+
+    if [[ -z "$status" ]]; then
+      warn "nmap returned no host block"
+      printf '%s\n' "$out" | sed -n '1,5p'
+    fi
+  else
+    if ! have timeout; then
+      warn "no 'timeout' command, probes may stall on filtered ports"
+    fi
+    local -a scan_ports=("${SCAN_FALLBACK_PORTS[@]}")
+    if [[ -n "$ports" ]]; then
+      mapfile -t scan_ports < <(scan_expand_ports "$ports")
+      if (( ${#scan_ports[@]} == 0 )); then
+        err "invalid port list: ${ports}"
+        return 1
+      fi
+    fi
+    out=$(scan_fallback_all "$ip" "$timeout" "$conc" "${scan_ports[@]}")
+    local p
+    while IFS=$'\t' read -r p line; do
+      [[ -z "$p" ]] && continue
+      open_ports+=("${p}/tcp|$(scan_service_name "$p")|")
+    done <<< "$out"
+    closed=$(( ${#scan_ports[@]} - ${#open_ports[@]} ))
+  fi
+
+  elapsed=$(( $(date +%s) - start ))
+
+  # --- results ------------------------------------------------------------
+  printf '\n%sResults%s\n' "$C_BOLD" "$C_RESET"
+  [[ -n "$status" ]] && printf '  host status : %s\n\n' "$status"
+
+  if (( ${#open_ports[@]} == 0 )); then
+    printf '  %sno open ports found%s\n' "$C_DIM" "$C_RESET"
+  else
+    local entry2 port state service ver
+    local -a sorted_ports=()
+    mapfile -t sorted_ports < <(printf '%s\n' "${open_ports[@]}" | sort -t/ -k1,1n)
+    printf '  %s%-9s %-6s %-14s %s%s\n' "$C_BOLD" "PORT" "STATE" "SERVICE" "VERSION" "$C_RESET"
+    for entry2 in ${sorted_ports[@]+"${sorted_ports[@]}"}; do
+      port="${entry2%%|*}"
+      entry2="${entry2#*|}"
+      service="${entry2%%|*}"
+      ver="${entry2#*|}"
+      printf '  %s%-9s%s %-6s %-14s %s\n' "$C_GREEN" "$port" "$C_RESET" "open" "$service" "$ver"
+    done
+  fi
+
+  # --- summary ------------------------------------------------------------
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Target  : %s (%s)\n' "$target" "$ip"
+  if [[ "$engine" == 'nmap' ]]; then
+    printf '  Engine  : nmap (-sT)\n'
+  else
+    printf '  Engine  : bash /dev/tcp\n'
+  fi
+  printf '  Scope   : %s\n' "$scope"
+  printf '  Open    : %s\n' "${#open_ports[@]}"
+  printf '  Not open: %s\n' "${closed:-0}"
+  printf '  Elapsed : %ss\n' "$elapsed"
+  if [[ "$engine" != 'nmap' ]]; then
+    printf '  %sinstall nmap for a full 1000 port scan and version detection%s\n' \
+      "$C_DIM" "$C_RESET"
+  fi
+  return 0
+}
+
 mod_info() {
   local target="${1:-}"
 
@@ -3468,7 +3761,7 @@ menu() {
       3) mod_dns ;;
       2) mod_info ;;
       6) mod_domain ;;
-      4) pending "scan" 16 ;;
+      4) mod_scan ;;
       5) mod_hosts ;;
       7) mod_links ;;
       8) mod_subdomains ;;
@@ -3519,7 +3812,7 @@ main() {
     dns)       mod_dns "${rest[0]:-}" ;;
     info)      mod_info "${rest[0]:-}" ;;
     domain)    mod_domain "${rest[0]:-}" ;;
-    scan)      pending "scan" 16 ;;
+    scan)      mod_scan ${rest[@]+"${rest[@]}"} ;;
     hosts)     mod_hosts ${rest[@]+"${rest[@]}"} ;;
     links)     mod_links ${rest[@]+"${rest[@]}"} ;;
     subdomains) mod_subdomains ${rest[@]+"${rest[@]}"} ;;

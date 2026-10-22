@@ -229,9 +229,27 @@ run hosts --help
 expect_match "hosts has its own usage" 'digger.sh hosts'
 
 # ---------------------------------------------------------------------------
+section "module: scan"
+
+run scan 'bad host!!'
+expect_match "scan rejects garbage" 'invalid target'
+
+run scan example.com
+expect_match "scan asks before probing" 'aborted'
+expect_status "scan refuses to probe without consent" 0
+
+run scan example.com --ports 443 -y
+expect_match "scan reports results" 'Results'
+expect_match "scan prints a summary" 'Summary'
+expect_status "scan runs with --yes" 0
+
+run scan --help
+expect_match "scan has its own usage" 'digger.sh scan'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in scan archive secrets dorks social net; do
+for m in archive secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done
