@@ -24,20 +24,24 @@ HTTP_TIMEOUT="${HTTP_TIMEOUT:-15}"
 HTTP_RETRIES="${HTTP_RETRIES:-1}"
 PY=""
 
-WORKDIR=""
 DIGGER_HOME=""
-cleanup() {
-  if [[ -n "$WORKDIR" && -d "$WORKDIR" ]]; then
-    rm -rf "$WORKDIR"
-  fi
-  return 0
-}
-trap cleanup EXIT INT TERM
 
 # Locate the directory holding digger.sh so shipped wordlists are found no
-# matter what the current working directory is.
+# matter what the current working directory is. A symlinked install (the
+# default for install.sh) is resolved to its real location first.
 resolve_home() {
-  local src="${BASH_SOURCE[0]}" dir
+  local src="${BASH_SOURCE[0]}" dir target
+  if have readlink; then
+    for _ in 1 2 3 4 5 6 7 8; do
+      [[ -L "$src" ]] || break
+      target=$(readlink -- "$src" 2>/dev/null || true)
+      [[ -z "$target" ]] && break
+      if [[ "$target" != /* ]]; then
+        target="$(cd -- "$(dirname -- "$src")" >/dev/null 2>&1 && pwd -P)/${target}"
+      fi
+      src="$target"
+    done
+  fi
   dir=$(cd -- "$(dirname -- "$src")" >/dev/null 2>&1 && pwd -P) || return 1
   DIGGER_HOME="$dir"
 }
@@ -5076,10 +5080,6 @@ main() {
   resolve_home || true
   PY="$(detect_python || true)"
   parse_args "$@"
-
-  if [[ ! -d "$WORKDIR" ]]; then
-    WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/digger.XXXXXX")
-  fi
 
   check_deps || true
 
