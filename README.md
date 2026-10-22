@@ -19,7 +19,7 @@ subcommands for scripting.
 ## Install
 
 ```bash
-git clone <this-repo> digger
+git clone https://github.com/tant28403-svg/DIGGER.git digger
 cd digger
 ./install.sh              # symlink into ~/.local/bin
 digger                    # menu
@@ -172,20 +172,6 @@ is present.
   what they will do and wait for a `y`.
 - Non-interactive runs (`cron`, CI, pipes) skip the prompt and refuse unless
   `-y` was given. They never hang waiting for input.
-
-## Tests
-
-```bash
-bash tests/smoke.sh
-```
-
-The suite runs every module in CLI mode against live targets and fails on a
-non-zero exit or missing expected output. Roughly 110 checks, including
-negative cases (invalid targets, missing consent, unknown flags).
-
-```bash
-shellcheck digger.sh install.sh tests/smoke.sh
-```
 
 ## Scope
 
