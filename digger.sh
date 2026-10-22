@@ -202,7 +202,12 @@ ${C_BOLD}COMMANDS${C_RESET}
   info <ip|host>             deep dive on an IP address or a website
   domain <domain>            registration data for a domain
   links <url>                crawl a site and list every link it finds
+  subdomains <domain>        passive subdomains, wordlist and pattern guessing
+  hosts <domain|ip>          reverse hosts on an address, optional vhost probing
   paths <url>                probe common paths and sensitive files
+  tls <host[:port]>          certificates, protocol versions and ciphers
+  cdn <domain|url>           CDN and WAF detection
+  intel <ip|domain>          threat intel, DNSBL and blocklist lookups
 
 ${C_BOLD}OPTIONS${C_RESET}
   -h, --help                 this help
@@ -2512,6 +2517,357 @@ mod_subdomains() {
   return 0
 }
 
+# --- Module 5: Host Finder -------------------------------------------------
+# Wrap an address so it can sit inside a URL or a --resolve argument.
+host_addr_literal() {
+  if is_ipv6 "$1"; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
+}
+
+# Reverse DNS: dig, then getent, then DNS over HTTPS for IPv4.
+host_ptr() {
+  local ip="$1" out='' name json
+  if have dig; then
+    out=$(dig +short +time=4 +tries=1 -x "$ip" 2>/dev/null | head -n1 || true)
+  fi
+  if [[ -z "$out" ]] && have getent; then
+    out=$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}' || true)
+  fi
+  if [[ -z "$out" ]] && is_ipv4 "$ip"; then
+    name=$(printf '%s' "$ip" | awk -F. '{print $4"."$3"."$2"."$1".in-addr.arpa"}')
+    json=$(http_get "https://dns.google/resolve?name=${name}&type=PTR" "$HTTP_TIMEOUT" 1) || json=''
+    if [[ -n "$json" ]]; then
+      out=$(json_get "$json" '.Answer[].data' 2>/dev/null | head -n1 || true)
+    fi
+  fi
+  out="${out%.}"
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+# Names that have historically resolved to an address. Passive sources only,
+# queried in parallel, tagged so the caller can count them per source.
+host_reverse_passive() {
+  local ip="$1"
+  (
+    local body
+    body=$(http_get "https://api.mnemonic.no/pdns/v3/${ip}?limit=100" 20 1) || body=''
+    if [[ -n "$body" && "$body" == \{* ]]; then
+      json_get "$body" '.data[].query' 2>/dev/null | awk '{print "m\t"$0}' || true
+    fi
+  ) &
+  (
+    local body
+    body=$(http_get "https://api.hackertarget.com/reverseiplookup/?q=${ip}" 15 1) || body=''
+    if [[ -n "$body" && "$body" != *'API count exceeded'* && \
+          "$body" != *'error'* && "$body" != *'<'* ]]; then
+      printf '%s\n' "$body" | tr -d '\r' \
+        | grep -E '^[A-Za-z0-9_.-]+$' | awk '{print "h\t"$0}' || true
+    fi
+  ) &
+  wait
+}
+
+# Ask an address for one hostname and record how it answers.
+host_probe_vhost() {
+  local vhost="$1" ip="$2" timeout="$3"
+  local lit out code='' size='' scheme='https'
+  lit=$(host_addr_literal "$ip")
+  out=$(curl -sS -k --max-time "$timeout" -o /dev/null \
+    -w '%{http_code} %{size_download}' \
+    --resolve "${vhost}:443:${lit}" "https://${vhost}/" 2>/dev/null || true)
+  code="${out%% *}"; size="${out##* }"
+  if [[ -z "$out" || "$code" == '000' ]]; then
+    out=$(curl -sS --max-time "$timeout" -o /dev/null \
+      -w '%{http_code} %{size_download}' \
+      -H "Host: ${vhost}" "http://${lit}/" 2>/dev/null || true)
+    code="${out%% *}"; size="${out##* }"; scheme='http'
+  fi
+  [[ "$code" =~ ^[0-9]+$ ]] || code='000'
+  [[ "$size" =~ ^[0-9]+$ ]] || size='0'
+  printf '%s\t%s\t%s\t%s\n' "$vhost" "$code" "$size" "$scheme"
+}
+
+# Probe hostnames read from stdin, keeping at most <conc> requests in flight.
+host_probe_all() {
+  local ip="$1" conc="$2" timeout="$3"
+  local -a pids=()
+  local vhost
+  while IFS= read -r vhost || [[ -n "$vhost" ]]; do
+    [[ -z "$vhost" ]] && continue
+    host_probe_vhost "$vhost" "$ip" "$timeout" &
+    pids+=($!)
+    if (( ${#pids[@]} >= conc )); then
+      wait "${pids[0]}" 2>/dev/null || true
+      pids=("${pids[@]:1}")
+    fi
+  done
+  wait 2>/dev/null || true
+}
+
+mod_hosts() {
+  local target='' wordlist='' conc=10 timeout=8 probe=0 limit=100
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --vhosts)      probe=1; shift ;;
+      --no-vhosts)   probe=0; shift ;;
+      --wordlist)    wordlist="${2:-}"; shift 2 || shift ;;
+      --concurrency) conc="${2:-10}"; shift 2 || shift ;;
+      --timeout)     timeout="${2:-8}"; shift 2 || shift ;;
+      --limit)       limit="${2:-100}"; shift 2 || shift ;;
+      -y|--yes)      ASSUME_YES=1; shift ;;
+      -h|--help)
+        printf 'usage: digger.sh hosts <domain|ip> [--vhosts] [--wordlist FILE] [--concurrency N] [--timeout SEC] [--limit N]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "HOST FINDER"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Domain or IP")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+  target="${target#*://}"
+  target="${target%%/*}"
+  target="${target%.}"
+  target="${target,,}"
+  if ! is_valid_target "$target"; then
+    err "invalid target: ${target}"
+    return 1
+  fi
+
+  [[ "$conc" =~ ^[0-9]+$ ]] && (( conc > 0 )) || conc=10
+  [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout > 0 )) || timeout=8
+  [[ "$limit" =~ ^[0-9]+$ ]] && (( limit > 0 )) || limit=100
+
+  local domain='' ip='' ptr=''
+  if is_ip "$target"; then
+    ip="$target"
+  else
+    domain="$target"
+  fi
+
+  info "Target: ${C_BOLD}${target}${C_RESET}"
+
+  # --- forward records ----------------------------------------------------
+  local -a a_recs=() aaaa_recs=() cname_recs=()
+  local r
+  if [[ -z "$ip" ]]; then
+    local -a raw_recs=()
+    mapfile -t raw_recs < <(dns_query "$domain" A 2>/dev/null || true)
+    for r in ${raw_recs[@]+"${raw_recs[@]}"}; do
+      is_ipv4 "$r" && a_recs+=("$r")
+    done
+    mapfile -t raw_recs < <(dns_query "$domain" AAAA 2>/dev/null || true)
+    for r in ${raw_recs[@]+"${raw_recs[@]}"}; do
+      is_ipv6 "$r" && aaaa_recs+=("$r")
+    done
+    mapfile -t cname_recs < <(dns_query "$domain" CNAME 2>/dev/null || true)
+    if (( ${#cname_recs[@]} > 0 )); then
+      local cname="${cname_recs[0]%.}"
+      if (( ${#a_recs[@]} == 0 && ${#aaaa_recs[@]} == 0 )); then
+        mapfile -t raw_recs < <(dns_query "$cname" A 2>/dev/null || true)
+        for r in ${raw_recs[@]+"${raw_recs[@]}"}; do
+          is_ipv4 "$r" && a_recs+=("$r")
+        done
+      fi
+    fi
+    ip="${a_recs[0]:-${aaaa_recs[0]:-}}"
+  fi
+
+  if [[ -z "$ip" ]]; then
+    err "could not resolve ${domain}"
+    return 1
+  fi
+
+  ptr=$(host_ptr "$ip" || true)
+
+  printf '\n%sForward%s\n' "$C_BOLD" "$C_RESET"
+  if (( ${#a_recs[@]} == 0 && ${#aaaa_recs[@]} == 0 && ${#cname_recs[@]} == 0 )); then
+    printf '  %sgiven as an address, no lookup needed%s\n' "$C_DIM" "$C_RESET"
+  fi
+  for r in ${a_recs[@]+"${a_recs[@]}"}; do
+    printf '  %-5s %s\n' "A" "$r"
+  done
+  for r in ${aaaa_recs[@]+"${aaaa_recs[@]}"}; do
+    printf '  %-5s %s\n' "AAAA" "$r"
+  done
+  for r in ${cname_recs[@]+"${cname_recs[@]}"}; do
+    printf '  %-5s %s\n' "CNAME" "$r"
+  done
+  if [[ -n "$ptr" ]]; then
+    printf '  %-5s %s\n' "PTR" "$ptr"
+  fi
+
+  # --- passive reverse ----------------------------------------------------
+  printf '\n%sReverse hosts%s %s(names seen on %s, passive)%s\n' \
+    "$C_BOLD" "$C_RESET" "$C_DIM" "$ip" "$C_RESET"
+  printf '  %squerying passive DNS...%s\n' "$C_DIM" "$C_RESET"
+
+  local raw n src
+  raw=$(host_reverse_passive "$ip" 2>/dev/null || true)
+
+  local -A seen_rev=() src_count=()
+  local -a rev_names=()
+  while IFS=$'\t' read -r src n; do
+    [[ -z "$src" ]] && continue
+    n="${n%.}"
+    n="${n,,}"
+    [[ -z "$n" ]] && continue
+    is_hostname "$n" || continue
+    src_count["$src"]=$(( ${src_count[$src]:-0} + 1 ))
+    [[ -n "${seen_rev[$n]:-}" ]] && continue
+    seen_rev["$n"]=1
+    rev_names+=("$n")
+  done <<< "$raw"
+
+  printf '  %-13s %s names\n' "mnemonic.no" "${src_count[m]:-0}"
+  printf '  %-13s %s names\n' "hackertarget" "${src_count[h]:-0}"
+
+  if (( ${#rev_names[@]} == 0 )); then
+    printf '\n  %snothing found (the sources rate limit and prune old records)%s\n' \
+      "$C_DIM" "$C_RESET"
+  else
+    local -a sorted_rev=()
+    mapfile -t sorted_rev < <(printf '%s\n' "${rev_names[@]}" | sort)
+    printf '\n  %s unique hostnames\n' "${#sorted_rev[@]}"
+    local shown=0 colour
+    for n in "${sorted_rev[@]}"; do
+      (( shown >= 40 )) && break
+      if [[ -n "$domain" && ( "$n" == "$domain" || "$n" == *".${domain}" ) ]]; then
+        colour="$C_GREEN"
+      else
+        colour="$C_RESET"
+      fi
+      printf '  %s%s%s\n' "$colour" "$n" "$C_RESET"
+      shown=$((shown + 1))
+    done
+    if (( ${#sorted_rev[@]} > shown )); then
+      printf '  %s... and %s more%s\n' "$C_DIM" "$(( ${#sorted_rev[@]} - shown ))" "$C_RESET"
+    fi
+  fi
+
+  # --- active virtual host probing ----------------------------------------
+  local different_count=0 failed_count=0 probed=0
+  if (( probe )); then
+    printf '\n%sVirtual hosts%s %s(active)%s\n' "$C_BOLD" "$C_RESET" "$C_YELLOW" "$C_RESET"
+
+    local -A seen_vh=()
+    local -a vhosts=()
+    local label
+    # Hostnames already seen on this address come first, they are the most
+    # promising candidates for a forgotten vhost.
+    for n in ${rev_names[@]+"${rev_names[@]}"}; do
+      (( ${#vhosts[@]} >= limit )) && break
+      [[ -n "${seen_vh[$n]:-}" ]] && continue
+      seen_vh["$n"]=1
+      vhosts+=("$n")
+    done
+    if [[ -n "$domain" ]]; then
+      if [[ -z "$wordlist" ]]; then
+        wordlist=$(wordlist_file "subdomains.txt" || true)
+      fi
+      if [[ -n "$wordlist" && -f "$wordlist" ]]; then
+        while IFS= read -r label || [[ -n "$label" ]]; do
+          (( ${#vhosts[@]} >= limit )) && break
+          label="${label%$'\r'}"
+          label="${label,,}"
+          [[ -z "$label" ]] && continue
+          [[ "$label" == \#* ]] && continue
+          [[ "$label" == *.* ]] && continue
+          n="${label}.${domain}"
+          is_hostname "$n" || continue
+          [[ -n "${seen_vh[$n]:-}" ]] && continue
+          seen_vh["$n"]=1
+          vhosts+=("$n")
+        done < "$wordlist"
+      else
+        warn "no subdomain wordlist found, probing passive names only"
+      fi
+    fi
+
+    if (( ${#vhosts[@]} == 0 )); then
+      warn "nothing to probe"
+    elif ! confirm "Send ${#vhosts[@]} Host-header probes to ${ip}?"; then
+      warn "vhost probing skipped"
+    else
+      local base_name baseline b_code b_size b_scheme
+      if [[ -n "$domain" ]]; then
+        base_name="digger-nope-$$-${RANDOM}.${domain}"
+      else
+        base_name="digger-nope-$$-${RANDOM}.invalid"
+      fi
+      baseline=$(host_probe_vhost "$base_name" "$ip" "$timeout")
+      IFS=$'\t' read -r _ b_code b_size b_scheme <<< "$baseline"
+      printf '  baseline    : %s %s (%s)\n' "$b_code" "$(human_size "$b_size")" "$b_scheme"
+      printf '  probing     : %s names, %s workers\n' "${#vhosts[@]}" "$conc"
+
+      local rawv
+      rawv=$(printf '%s\n' "${vhosts[@]}" | host_probe_all "$ip" "$conc" "$timeout")
+
+      local -a different=() failed=()
+      local vh code size scheme diff
+      while IFS=$'\t' read -r vh code size scheme; do
+        [[ -z "$vh" ]] && continue
+        probed=$((probed + 1))
+        if [[ "$code" == '000' ]]; then
+          failed+=("${vh}|${code}|${size}|${scheme}")
+          failed_count=$((failed_count + 1))
+          continue
+        fi
+        diff=$(( size - b_size ))
+        (( diff < 0 )) && diff=$(( -diff ))
+        if [[ "$code" != "$b_code" ]] || (( diff > 32 )); then
+          different+=("${vh}|${code}|${size}|${scheme}")
+          different_count=$((different_count + 1))
+        fi
+      done <<< "$rawv"
+
+      printf '\n%sResults%s\n' "$C_BOLD" "$C_RESET"
+      printf '  probed %s, %s answered differently, %s unreachable\n' \
+        "$probed" "$different_count" "$failed_count"
+
+      if [[ "$b_code" == '000' ]]; then
+        printf '  %sthe address did not answer over HTTP or HTTPS, no baseline to compare%s\n' \
+          "$C_DIM" "$C_RESET"
+      elif (( ${#different[@]} > 0 )); then
+        printf '\n%sNot the default response%s (%s)\n' "$C_GREEN" "$C_RESET" "${#different[@]}"
+        shown=0
+        local entry
+        for entry in "${different[@]}"; do
+          (( shown >= 40 )) && break
+          IFS='|' read -r vh code size scheme <<< "$entry"
+          printf '  %s%-4s%s %-44s %10s  %s\n' \
+            "$C_GREEN" "$code" "$C_RESET" "$vh" "$(human_size "$size")" "$scheme"
+          shown=$((shown + 1))
+        done
+        if (( ${#different[@]} > shown )); then
+          printf '  %s... and %s more%s\n' "$C_DIM" "$(( ${#different[@]} - shown ))" "$C_RESET"
+        fi
+      else
+        printf '  %severything replied like the default vhost%s\n' "$C_DIM" "$C_RESET"
+      fi
+    fi
+  fi
+
+  # --- summary ------------------------------------------------------------
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Address      : %s\n' "$ip"
+  [[ -n "$ptr" ]] && printf '  PTR          : %s\n' "$ptr"
+  printf '  Reverse names: %s\n' "${#rev_names[@]}"
+  printf '  Vhost probes : %s\n' "$probed"
+  return 0
+}
+
 mod_info() {
   local target="${1:-}"
 
@@ -3113,7 +3469,7 @@ menu() {
       2) mod_info ;;
       6) mod_domain ;;
       4) pending "scan" 16 ;;
-      5) pending "hosts" 15 ;;
+      5) mod_hosts ;;
       7) mod_links ;;
       8) mod_subdomains ;;
       9) pending "archive" 9 ;;
@@ -3164,7 +3520,7 @@ main() {
     info)      mod_info "${rest[0]:-}" ;;
     domain)    mod_domain "${rest[0]:-}" ;;
     scan)      pending "scan" 16 ;;
-    hosts)     pending "hosts" 15 ;;
+    hosts)     mod_hosts ${rest[@]+"${rest[@]}"} ;;
     links)     mod_links ${rest[@]+"${rest[@]}"} ;;
     subdomains) mod_subdomains ${rest[@]+"${rest[@]}"} ;;
     archive)   pending "archive" 9 ;;

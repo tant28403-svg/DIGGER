@@ -210,9 +210,28 @@ expect_match "subdomains queries the passive sources" 'passive sources'
 expect_status "subdomains passive run exits 0" 0
 
 # ---------------------------------------------------------------------------
+section "module: hosts"
+
+run hosts 'not a host!!'
+expect_match "hosts rejects garbage" 'invalid target'
+
+run hosts example.com
+expect_match "hosts prints forward records" 'Forward'
+expect_match "hosts prints reverse hosts" 'Reverse hosts'
+expect_match "hosts prints a summary" 'Summary'
+expect_status "hosts passive run exits 0" 0
+
+run hosts example.com --vhosts --limit 1
+expect_match "hosts skips probing without consent" 'vhost probing skipped'
+expect_status "hosts refuses active probing non-interactively" 0
+
+run hosts --help
+expect_match "hosts has its own usage" 'digger.sh hosts'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in scan hosts archive secrets dorks social net; do
+for m in scan archive secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done
