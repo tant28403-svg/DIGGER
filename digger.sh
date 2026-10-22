@@ -330,7 +330,7 @@ http_get() {
       --max-time "$timeout" --connect-timeout "$timeout" \
       -H "User-Agent: $USER_AGENT" \
       -H 'Accept: */*' \
-      -- "$url" 2>/dev/null </dev/null)
+      -- "$url" 2>/dev/null </dev/null | tr -d '\000')
     rc=$?
     set -e
     if (( rc == 0 )) && [[ -n "$out" ]]; then
@@ -568,7 +568,11 @@ header_present() {
 
 page_body() {
   local url="$1" limit="${2:-500000}" body=''
+  # Binary targets (favicons, fonts, images) can contain NUL bytes. Bash
+  # removes them from command substitution and prints a warning, so drop
+  # the NULs before capture.
   body=$(curl -sS -L -k --max-time 20 -H "User-Agent: $USER_AGENT" -- "$url" 2>/dev/null \
+    | tr -d '\000' \
     | head -c "$limit" || true)
   printf '%s' "$body"
 }
@@ -1425,6 +1429,7 @@ social_check_one() {
   # Some sites return 200 for every name and explain the miss in the page.
   if [[ "$result" == 'found' && -n "$marker" ]]; then
     body=$(curl -sS -L -m "$timeout" -A "$USER_AGENT" -- "$url" 2>/dev/null \
+      | tr -d '\000' \
       | head -c 200000 || true)
     if printf '%s' "$body" | grep -qiE -- "$marker"; then
       result='missing'
