@@ -1,0 +1,11 @@
+# Normalise text handling in the repository
+* text=auto
+
+# Shell scripts must always be LF, otherwise Linux throws
+# "bad interpreter: /usr/bin/env bash^M" when the file is cloned on Windows
+# and run through WSL, or checked out with CRLF.
+*.sh text eol=lf
+
+# No line-ending translation for these
+LICENSE text eol=lf
+README.md text eol=lf
