@@ -286,9 +286,35 @@ run archive --help
 expect_match "archive has its own usage" 'digger.sh archive'
 
 # ---------------------------------------------------------------------------
+section "module: dorks"
+
+run dorks example.com
+expect_match "dorks prints a files query" 'site:example\.com filetype:pdf'
+expect_match "dorks groups by category" 'Admin panels and listings'
+expect_match "dorks prints a summary" 'Summary'
+expect_status "dorks runs offline" 0
+
+run dorks example.com --category config --links
+expect_match "dorks filters categories" 'Config and secrets'
+expect_match "dorks builds search urls" 'https://www\.google\.com/search\?q='
+expect_match "dorks reports the filtered count" 'Queries     : 7'
+
+run dorks example.com --category nope
+expect_match "dorks rejects an unknown category" 'unknown category'
+
+run dorks example.com --engine nope
+expect_match "dorks rejects an unknown engine" 'unknown engine'
+
+run dorks 'bad host!!'
+expect_match "dorks rejects garbage" 'invalid domain'
+
+run dorks --help
+expect_match "dorks has its own usage" 'digger.sh dorks'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in dorks social net; do
+for m in social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done

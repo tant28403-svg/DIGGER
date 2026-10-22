@@ -210,6 +210,7 @@ ${C_BOLD}COMMANDS${C_RESET}
   cdn <domain|url>           CDN and WAF detection
   intel <ip|domain>          threat intel, DNSBL and blocklist lookups
   archive <domain|url>       archived snapshots, coverage and recent captures
+  dorks <domain>             search engine dorks by category, offline
   secrets <url>              crawl a site and flag API keys, tokens and leaks
 
 ${C_BOLD}OPTIONS${C_RESET}
@@ -819,6 +820,35 @@ url_path() {
   printf '%s' "$1" | sed -E 's#^[a-z]+://[^/]+##'
 }
 
+# Percent encode a query value for a search engine URL.
+urlencode_q() {
+  local s="$1" out='' quote="'"
+  # Prefix the value for the same reason as url_join: MSYS rewrites anything
+  # that looks like a POSIX path before the python process starts.
+  if [[ -n "$PY" ]]; then
+    out=$(URLENC_IN="x${s}" "$PY" -c \
+      'import os,urllib.parse;print(urllib.parse.quote_plus(os.environ["URLENC_IN"][1:]))' \
+      2>/dev/null || true)
+    if [[ -n "$out" ]]; then
+      printf '%s' "$out"
+      return 0
+    fi
+  fi
+  s="${s//%/%25}"
+  s="${s// /+}"
+  s="${s//\"/%22}"
+  s="${s//:/%3A}"
+  s="${s//\//%2F}"
+  s="${s//\?/%3F}"
+  s="${s//&/%26}"
+  s="${s//=/%3D}"
+  s="${s//#/%23}"
+  s="${s//</%3C}"
+  s="${s//>/%3E}"
+  s="${s//$quote/%27}"
+  printf '%s' "$s"
+}
+
 # Pull every candidate link out of an HTML document.
 extract_links() {
   local body="$1"
@@ -1003,6 +1033,185 @@ mod_links() {
     printf '\n%sExternal links%s (%s)\n' "$C_BOLD" "$C_RESET" "$(printf '%s\n' "$uniq_ext" | grep -c . || true)"
     printf '%s\n' "$uniq_ext" | sed 's/^/  /'
   fi
+  return 0
+}
+
+# --- Module 15: Search Dork Generator --------------------------------------
+# Build search engine queries from a domain. Purely offline, nothing is sent.
+DORK_CATS=(files config panels leaks errors docs hosts)
+
+dorks_title() {
+  case "$1" in
+    files)   printf 'Files and documents' ;;
+    config)  printf 'Config and secrets' ;;
+    panels)  printf 'Admin panels and listings' ;;
+    leaks)   printf 'Leaks and third party' ;;
+    errors)  printf 'Errors and stack traces' ;;
+    docs)    printf 'Internal documents' ;;
+    hosts)   printf 'Hosts and environments' ;;
+    *)       printf '%s' "$1" ;;
+  esac
+}
+
+dorks_queries() {
+  local d="$1"
+  cat <<EOF
+files	site:${d} filetype:pdf
+files	site:${d} filetype:xls OR filetype:xlsx
+files	site:${d} filetype:doc OR filetype:docx
+files	site:${d} filetype:ppt OR filetype:pptx
+files	site:${d} filetype:csv
+files	site:${d} filetype:sql
+files	site:${d} filetype:log
+files	site:${d} filetype:bak OR filetype:old
+config	site:${d} ext:env
+config	site:${d} ext:ini OR ext:cfg
+config	site:${d} ext:yaml OR ext:yml
+config	site:${d} ext:json "api_key"
+config	site:${d} ext:xml "password"
+config	site:${d} "DB_PASSWORD"
+config	site:${d} "BEGIN RSA PRIVATE KEY"
+panels	site:${d} inurl:admin
+panels	site:${d} inurl:login OR inurl:signin
+panels	site:${d} inurl:wp-admin
+panels	site:${d} inurl:phpmyadmin
+panels	site:${d} inurl:dashboard
+panels	site:${d} intitle:"index of"
+panels	site:${d} inurl:"/.git"
+leaks	"${d}" site:pastebin.com
+leaks	"${d}" site:github.com
+leaks	"${d}" site:gitlab.com
+leaks	"${d}" filetype:txt password
+leaks	site:${d} inurl:password
+leaks	site:${d} inurl:token OR inurl:apikey
+leaks	"@${d}" -site:${d}
+errors	site:${d} "SQL syntax.*MySQL"
+errors	site:${d} "Warning: mysql_"
+errors	site:${d} "Fatal error"
+errors	site:${d} "stack trace"
+errors	site:${d} "Uncaught exception"
+docs	site:${d} "confidential"
+docs	site:${d} "internal use only"
+docs	site:${d} filetype:pdf "not for distribution"
+docs	site:${d} intitle:"employee handbook"
+hosts	site:*.${d}
+hosts	site:${d} -www
+hosts	site:${d} inurl:dev OR inurl:staging OR inurl:test
+hosts	site:${d} inurl:api
+EOF
+}
+
+dorks_engine_url() {
+  local engine="$1" query="$2" encoded
+  case "$engine" in
+    bing)       encoded=$(urlencode_q "$query"); printf 'https://www.bing.com/search?q=%s' "$encoded" ;;
+    duckduckgo) encoded=$(urlencode_q "$query"); printf 'https://duckduckgo.com/?q=%s' "$encoded" ;;
+    brave)      encoded=$(urlencode_q "$query"); printf 'https://search.brave.com/search?q=%s' "$encoded" ;;
+    *)          encoded=$(urlencode_q "$query"); printf 'https://www.google.com/search?q=%s' "$encoded" ;;
+  esac
+}
+
+mod_dorks() {
+  local target='' only='' engine='google'
+  local links=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --category) only="${2:-}"; shift 2 || shift ;;
+      --engine)   engine="${2:-google}"; shift 2 || shift ;;
+      --links)    links=1; shift ;;
+      -h|--help)
+        printf 'usage: digger.sh dorks <domain> [--category NAME] [--engine google|bing|duckduckgo|brave] [--links]\n'
+        printf 'categories: %s\n' "${DORK_CATS[*]}"
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "SEARCH DORK GENERATOR"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Domain")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no domain given"
+    return 1
+  fi
+  target="${target#*://}"
+  target="${target%%/*}"
+  target="${target%%:*}"
+  target="${target%.}"
+  target="${target,,}"
+  if ! is_hostname "$target" && ! is_ip "$target"; then
+    err "invalid domain: ${target}"
+    return 1
+  fi
+
+  case "${engine,,}" in
+    google|bing|duckduckgo|brave) engine="${engine,,}" ;;
+    *) err "unknown engine: ${engine} (try google, bing, duckduckgo or brave)"; return 1 ;;
+  esac
+
+  local valid=0 c
+  if [[ -n "$only" ]]; then
+    only="${only,,}"
+    for c in "${DORK_CATS[@]}"; do
+      [[ "$c" == "$only" ]] && valid=1
+    done
+    if (( valid == 0 )); then
+      err "unknown category: ${only} (try ${DORK_CATS[*]})"
+      return 1
+    fi
+  fi
+
+  local rows total
+  rows=$(dorks_queries "$target")
+  total=0
+  while IFS=$'\t' read -r c _ || [[ -n "$c" ]]; do
+    [[ -z "$c" ]] && continue
+    if [[ -n "$only" && "$c" != "$only" ]]; then
+      continue
+    fi
+    total=$((total + 1))
+  done <<< "$rows"
+
+  info "Target: ${C_BOLD}${target}${C_RESET}"
+  printf '  Categories  : %s\n' "${#DORK_CATS[@]}"
+  [[ -n "$only" ]] && printf '  Filter      : %s\n' "$only"
+  printf '  Queries     : %s\n' "$total"
+  printf '  Engine      : %s %s(add --links for search urls)%s\n' \
+    "$engine" "$C_DIM" "$C_RESET"
+
+  local -a items=()
+  local q n
+  for c in "${DORK_CATS[@]}"; do
+    if [[ -n "$only" && "$only" != "$c" ]]; then
+      continue
+    fi
+    items=()
+    while IFS=$'\t' read -r cat q || [[ -n "$cat" ]]; do
+      [[ "$cat" == "$c" ]] && items+=("$q")
+    done <<< "$rows"
+    (( ${#items[@]} == 0 )) && continue
+
+    printf '\n%s%s%s (%s)\n' "$C_BOLD" "$(dorks_title "$c")" "$C_RESET" "${#items[@]}"
+    for q in "${items[@]}"; do
+      printf '  %s\n' "$q"
+      if (( links )); then
+        printf '    %s%s%s\n' "$C_DIM" "$(dorks_engine_url "$engine" "$q")" "$C_RESET"
+      fi
+    done
+  done
+
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Target   : %s\n' "$target"
+  printf '  Queries  : %s\n' "$total"
+  printf '  %sresults depend on the engine: check each hit before trusting it%s\n' \
+    "$C_DIM" "$C_RESET"
   return 0
 }
 
@@ -4308,7 +4517,7 @@ menu() {
       12) mod_cdn ;;
       13) mod_intel ;;
       14) mod_secrets ;;
-      15) pending "dorks" 18 ;;
+      15) mod_dorks ;;
       16) pending "social" 19 ;;
       17) pending "net" 20 ;;
       0) printf '\n%sbye%s\n' "$C_DIM" "$C_RESET"; return 0 ;;
@@ -4359,7 +4568,7 @@ main() {
     cdn)       mod_cdn ${rest[@]+"${rest[@]}"} ;;
     intel)     mod_intel ${rest[@]+"${rest[@]}"} ;;
     secrets)   mod_secrets ${rest[@]+"${rest[@]}"} ;;
-    dorks)     pending "dorks" 18 ;;
+    dorks)     mod_dorks ${rest[@]+"${rest[@]}"} ;;
     social)    pending "social" 19 ;;
     net)       pending "net" 20 ;;
     modules)   module_registry ;;
