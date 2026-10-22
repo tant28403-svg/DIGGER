@@ -99,7 +99,7 @@ list to probe.
 | `curl` | every HTTP module | required; the tool reports it at startup |
 | `jq` **or** `python3` | JSON parsing | strongly recommended; without either, JSON-based lookups fail |
 | `dig` | DNS records and faster subdomain resolution | DNS over HTTPS is used instead; brute-force budget drops from 1500 to 150 names |
-| `nmap` | full port scan and version detection | a built-in `/dev/tcp` scanner checks 63 common ports |
+| `nmap` | full port scan and version detection | a built-in `/dev/tcp` scanner checks 62 common ports |
 | `openssl` | TLS inspector and the TLS part of `info` | the `tls` module reports it is unavailable; the TLS summary in `info` is skipped |
 | `whois` | fallback when RDAP fails | RDAP is used on its own |
 | `traceroute`, `mtr` or `ping` | network path | the module tries all three and warns if none is usable |

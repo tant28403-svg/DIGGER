@@ -299,8 +299,15 @@ is_ipv4() {
 is_ipv6() {
   local ip="$1"
   [[ "$ip" == *:* ]] || return 1
+  if [[ -n "$PY" ]]; then
+    "$PY" -c 'import socket,sys
+try:
+    socket.inet_pton(socket.AF_INET6, sys.argv[1])
+except Exception:
+    sys.exit(1)' "$ip" >/dev/null 2>&1
+    return $?
+  fi
   [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
-  return 0
 }
 
 is_ip() { is_ipv4 "$1" || is_ipv6 "$1"; }
@@ -441,10 +448,15 @@ else:
 PYEOF
 
 json_get() {
-  local json="$1" filter="$2"
+  local json="$1" filter="$2" out=''
   [[ -n "$json" ]] || return 1
   if have jq; then
-    printf '%s' "$json" | jq -r "$filter" 2>/dev/null
+    out=$(printf '%s' "$json" | jq -r "$filter" 2>/dev/null) || return 1
+    # jq prints the literal 'null' for missing keys; drop those lines so
+    # callers see an empty result (and a failure) instead of the string.
+    out=$(printf '%s\n' "$out" | sed '/^null$/d')
+    [[ -z "$out" ]] && return 1
+    printf '%s' "$out"
   elif [[ -n "$PY" ]]; then
     printf '%s' "$json" | "$PY" -c "$PY_JSON_GET" "$filter" 2>/dev/null
   else
@@ -564,6 +576,23 @@ header_present() {
   local headers="$1" name="$2"
   printf '%s' "$headers" | grep -qi "^${name}:" || return 1
   return 0
+}
+
+# Like header_present, but a signature may be "name: value" (value is then
+# required as a substring of the header value) or just "name" (presence).
+header_sig_present() {
+  local headers="$1" sig="$2" name val v
+  if [[ "$sig" == *:* ]]; then
+    name="${sig%%:*}"
+    name="${name// /}"
+    val="${sig#*:}"
+    val="${val# }"
+    header_present "$headers" "$name" || return 1
+    v=$(header_value "$headers" "$name")
+    printf '%s' "$v" | grep -qi -- "$val"
+  else
+    header_present "$headers" "$sig"
+  fi
 }
 
 page_body() {
@@ -713,7 +742,9 @@ detect_tech() {
     'x-nextjs-cache' 'x-nf-request-id' ; do
     if header_present "$headers" "${sig%%:*}"; then
       val=$(header_value "$headers" "${sig%%:*}")
-      [[ "$val" == "${sig#*:}"* ]] || continue
+      if [[ "$sig" == *:* ]]; then
+        [[ "$val" == "${sig#*:}"* ]] || continue
+      fi
       out+=("$(printf '%-18s %s' "${sig%%:*}" "$val")")
     fi
   done
@@ -1551,14 +1582,14 @@ mod_social() {
   if (( ${#found[@]} == 0 )); then
     printf '  %snothing under this handle%s\n' "$C_DIM" "$C_RESET"
   fi
-  for item in ${found[@]+"${found[@]}"}; do
+  for item in "${found[@]+"${found[@]}"}"; do
     IFS='|' read -r l u c <<< "$item"
     printf '  %s%-12s%s %s\n' "$C_GREEN" "$l" "$C_RESET" "$u"
   done
 
   printf '\n%sNot found%s (%s)\n' "$C_DIM" "$C_RESET" "${#missing[@]}"
   if (( verbose )); then
-    for item in ${missing[@]+"${missing[@]}"}; do
+    for item in "${missing[@]+"${missing[@]}"}"; do
       IFS='|' read -r l u c <<< "$item"
       printf '  %-12s %-52s %s\n' "$l" "$u" "$c"
     done
@@ -2133,10 +2164,10 @@ mod_paths() {
     title="${spec%%:*}"
     colour="${spec#*:}"
     case "$title" in
-      found)      group=("${found[@]}") ;;
-      interesting) group=("${interesting[@]}") ;;
-      soft)       group=("${soft[@]}") ;;
-      missing)    group=("${missing[@]}") ;;
+      found)      group=("${found[@]+"${found[@]}"}") ;;
+      interesting) group=("${interesting[@]+"${interesting[@]}"}") ;;
+      soft)       group=("${soft[@]+"${soft[@]}"}") ;;
+      missing)    group=("${missing[@]+"${missing[@]}"}") ;;
     esac
     (( ${#group[@]} == 0 )) && continue
     case "$title" in
@@ -2238,13 +2269,16 @@ tls_proto_of() {
 
 # Does the subject alternative name list cover this host?
 tls_covers_host() {
-  local san="$1" host="$2" n suffix
+  local san="$1" host="$2" n suffix label
   while IFS= read -r n; do
     [[ -z "$n" ]] && continue
     if [[ "$n" == "$host" ]]; then return 0; fi
     if [[ "$n" == '*.'* ]]; then
       suffix="${n#*.}"
-      if [[ "$host" == *".${suffix}" ]]; then return 0; fi
+      if [[ "$host" == *".${suffix}" ]]; then
+        label="${host%."${suffix}"}"
+        [[ "$label" != *.* ]] && return 0
+      fi
     fi
   done < <(printf '%s' "$san" | tr ',' '\n' \
     | sed -E 's/^[[:space:]]*DNS://I; s/^[[:space:]]*//; s/[[:space:]]*$//')
@@ -2574,7 +2608,7 @@ strict-transport-security"
     sm=(); wm=()
     IFS=',' read -ra hs <<< "$hdrs"
     for h in "${hs[@]}"; do
-      if header_present "$headers" "$h"; then
+      if header_sig_present "$headers" "$h"; then
         sm+=("header ${h}")
       fi
     done
@@ -2604,7 +2638,7 @@ strict-transport-security"
     sm=(); wm=()
     IFS=',' read -ra hs <<< "$hdrs"
     for h in "${hs[@]}"; do
-      if header_present "$headers" "$h"; then
+      if header_sig_present "$headers" "$h"; then
         sm+=("header ${h}")
       fi
     done
@@ -2816,7 +2850,7 @@ mod_intel() {
     body=$(http_get "https://cinsscore.com/list/ci-badguys.txt" 25 1) || body=''
     checked=$((checked + 1))
     if [[ -n "$body" ]]; then
-      if printf '%s\n' "$body" | grep -qE "(^|[^0-9.])${ip}([^0-9.]|$)"; then
+      if printf '%s\n' "$body" | grep -qE "(^|[^0-9.])${ip//./\\.}([^0-9.]|$)"; then
         printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "cinsscore.com" "listed"
         findings+=("listed on cinsscore.com")
         listed=$((listed + 1))
@@ -2830,7 +2864,7 @@ mod_intel() {
     body=$(http_get "https://check.torproject.org/torbulkexitlist" 25 1) || body=''
     checked=$((checked + 1))
     if [[ -n "$body" ]]; then
-      if printf '%s\n' "$body" | grep -qE "(^|[^0-9.])${ip}([^0-9.]|$)"; then
+      if printf '%s\n' "$body" | grep -qE "(^|[^0-9.])${ip//./\\.}([^0-9.]|$)"; then
         printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "tor exit nodes" "listed"
         findings+=("listed as a Tor exit node")
         listed=$((listed + 1))
@@ -2851,7 +2885,7 @@ mod_intel() {
     feed=$(http_get "https://openphish.com/feed.txt" 25 1) || feed=''
     checked=$((checked + 1))
     if [[ -n "$feed" ]]; then
-      if printf '%s\n' "$feed" | grep -qiF "$target"; then
+      if printf '%s\n' "$feed" | grep -qiE "(^|[^A-Za-z0-9.-])${target//./\\.}(/|$)"; then
         printf '  %s[!]%s %-30s %s\n' "$C_RED" "$C_RESET" "openphish.com" "listed"
         findings+=("listed on openphish.com")
         listed=$((listed + 1))
@@ -3038,7 +3072,7 @@ for row in (data.get('data') or []):
     local body
     body=$(http_get "https://api.hackertarget.com/hostsearch/?q=${domain}" 12 1) || body=''
     if [[ -n "$body" ]] && printf '%s' "$body" | grep -qiE '^[a-z0-9.-]+,[0-9a-f.:]+$'; then
-      printf '%s\n' "$body" | tr '[:upper:]' '[:lower:]' | grep -E '^[a-z0-9._-]+,[0-9a-f.:]+$' || true
+      printf '%s\n' "$body" | tr '[:upper:]' '[:lower:]' | grep -E '^[a-z0-9._-]+,[0-9a-f.:]+$' | tr ',' '\t' || true
     fi
   ) &
 
@@ -3416,7 +3450,7 @@ mod_subdomains() {
       cip="${line#*$'\t'}"
       confirmed["$cname"]="$cip"
     done < <(printf '%s\n' ${sample[@]+"${sample[@]}"} | while IFS= read -r x; do
-      cjson=$(http_get "https://cloudflare-dns.com/dns-query?name=${x}&type=A" 8 1) || cjson=''
+      cjson=$(http_get "https://dns.google/resolve?name=${x}&type=A" 8 1) || cjson=''
       cip=$(sub_doh_pick_ip "$cjson" || true)
       [[ -z "$cip" ]] && continue
       printf '%s\t%s\n' "$x" "$cip"
@@ -3457,9 +3491,9 @@ mod_subdomains() {
   for group in high medium low; do
     entries=()
     case "$group" in
-      high)   title="HIGH CONFIDENCE";   colour="$C_GREEN";  entries=(${high[@]+"${high[@]}"}) ;;
-      medium) title="MEDIUM CONFIDENCE"; colour="$C_YELLOW"; entries=(${medium[@]+"${medium[@]}"}) ;;
-      low)    title="LOW CONFIDENCE";    colour="$C_DIM";    entries=(${low[@]+"${low[@]}"}) ;;
+      high)   title="HIGH CONFIDENCE";   colour="$C_GREEN";  entries=("${high[@]+"${high[@]}"}") ;;
+      medium) title="MEDIUM CONFIDENCE"; colour="$C_YELLOW"; entries=("${medium[@]+"${medium[@]}"}") ;;
+      low)    title="LOW CONFIDENCE";    colour="$C_DIM";    entries=("${low[@]+"${low[@]}"}") ;;
     esac
     (( ${#entries[@]} == 0 )) && continue
     printf '\n%s%s%s (%s)\n' "$colour" "$title" "$C_RESET" "${#entries[@]}"
@@ -3537,7 +3571,7 @@ host_reverse_passive() {
     if [[ -n "$body" && "$body" != *'API count exceeded'* && \
           "$body" != *'error'* && "$body" != *'<'* ]]; then
       printf '%s\n' "$body" | tr -d '\r' \
-        | grep -E '^[A-Za-z0-9_.-]+$' | awk '{print "h\t"$0}' || true
+        | awk -F, '{print $1}' | grep -E '^[A-Za-z0-9_.-]+$' | awk '{print "h\t"$0}' || true
     fi
   ) &
   wait
@@ -4426,9 +4460,9 @@ mod_secrets() {
   for spec in "high:${C_RED}:HIGH" "medium:${C_YELLOW}:MEDIUM" "low:${C_DIM}:LOW"; do
     IFS=':' read -r level colour title <<< "$spec"
     case "$level" in
-      high)   entries=(${high[@]+"${high[@]}"}) ;;
-      medium) entries=(${medium[@]+"${medium[@]}"}) ;;
-      low)    entries=(${low[@]+"${low[@]}"}) ;;
+      high)   entries=("${high[@]+"${high[@]}"}") ;;
+      medium) entries=("${medium[@]+"${medium[@]}"}") ;;
+      low)    entries=("${low[@]+"${low[@]}"}") ;;
     esac
     printf '\n%s%s%s (%s)\n' "$colour" "$title" "$C_RESET" "${#entries[@]}"
     if (( ${#entries[@]} == 0 )); then
@@ -4530,8 +4564,13 @@ info_for_ip() {
     end=$(json_get "$rdap" '.endAddress') || end=''
     rtype=$(json_get "$rdap" '.type') || rtype=''
     prefix=$(json_get "$rdap" '.cidr0_cidrs[0].v4prefix') || prefix=''
+    if [[ -z "$prefix" ]]; then
+      prefix=$(json_get "$rdap" '.cidr0_cidrs[0].v6prefix') || prefix=''
+    fi
     length=$(json_get "$rdap" '.cidr0_cidrs[0].length') || length=''
-    [[ -n "$prefix" && -n "$length" ]] && cidr="${prefix}/${length}"
+    if [[ -n "$prefix" && -n "$length" ]]; then
+      cidr="${prefix}/${length}"
+    fi
     rname=$(rdap_role_field "$rdap" 'registrant' 'fn') || rname=$(rdap_role_field "$rdap" 'registrant' 'org') || rname=''
     abuse=$(rdap_role_field "$rdap" 'abuse' 'email') || abuse=''
     rcountry=$(json_get "$rdap" '.country') || rcountry=''
@@ -4889,8 +4928,16 @@ mod_myip() {
     asfull=$(json_get "$geo2" '.as') || asfull=''
 
     printf '\n%sExposure flags%s\n' "$C_BOLD" "$C_RESET"
-    [[ "$proxy" == "true" ]] && printf '  %sProxy/VPN detected%s\n' "$C_YELLOW" "$C_RESET" || printf '  Proxy/VPN   : no\n'
-    [[ "$hosting" == "true" ]] && printf '  %sHosting provider%s\n' "$C_YELLOW" "$C_RESET" || printf '  Hosting     : no\n'
+    if [[ "$proxy" == "true" ]]; then
+      printf '  %sProxy/VPN detected%s\n' "$C_YELLOW" "$C_RESET"
+    else
+      printf '  Proxy/VPN   : no\n'
+    fi
+    if [[ "$hosting" == "true" ]]; then
+      printf '  %sHosting provider%s\n' "$C_YELLOW" "$C_RESET"
+    else
+      printf '  Hosting     : no\n'
+    fi
     printf '  Reverse DNS : %s\n' "${reverse:-n/a}"
     [[ -n "$asfull" ]] && printf '  AS          : %s\n' "$asfull"
   fi
