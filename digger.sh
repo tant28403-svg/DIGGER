@@ -25,6 +25,7 @@ HTTP_RETRIES="${HTTP_RETRIES:-1}"
 PY=""
 
 WORKDIR=""
+DIGGER_HOME=""
 cleanup() {
   if [[ -n "$WORKDIR" && -d "$WORKDIR" ]]; then
     rm -rf "$WORKDIR"
@@ -32,6 +33,44 @@ cleanup() {
   return 0
 }
 trap cleanup EXIT INT TERM
+
+# Locate the directory holding digger.sh so shipped wordlists are found no
+# matter what the current working directory is.
+resolve_home() {
+  local src="${BASH_SOURCE[0]}" dir
+  dir=$(cd -- "$(dirname -- "$src")" >/dev/null 2>&1 && pwd -P) || return 1
+  DIGGER_HOME="$dir"
+}
+
+# Print the path to a shipped wordlist, or fail if it cannot be found.
+wordlist_file() {
+  local name="$1" p
+  for p in "${DIGGER_HOME}/wordlist/${name}" "./wordlist/${name}" \
+           "${HOME}/.local/share/digger/wordlist/${name}" \
+           "/usr/share/digger/wordlist/${name}"; do
+    if [[ -f "$p" ]]; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Human readable byte count.
+human_size() {
+  local b="${1:-0}"
+  if [[ "$b" =~ ^[0-9]+$ ]]; then
+    if (( b >= 1048576 )); then
+      awk -v n="$b" 'BEGIN{printf "%.1f MB", n/1048576}'
+    elif (( b >= 1024 )); then
+      awk -v n="$b" 'BEGIN{printf "%.1f KB", n/1024}'
+    else
+      printf '%s B' "$b"
+    fi
+  else
+    printf '%s' "$b"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Colours
@@ -160,12 +199,18 @@ ${C_BOLD}USAGE${C_RESET}
 ${C_BOLD}COMMANDS${C_RESET}
   myip                       your public IP, geo, ISP and ASN
   dns <domain|ip>            DNS records for a domain (A AAAA MX NS TXT CNAME SOA CAA)
+  info <ip|host>             deep dive on an IP address or a website
+  domain <domain>            registration data for a domain
+  links <url>                crawl a site and list every link it finds
+  paths <url>                probe common paths and sensitive files
 
 ${C_BOLD}OPTIONS${C_RESET}
   -h, --help                 this help
   --version                  print version
   --no-color                 disable ANSI colours
   --no-banner                suppress the banner
+  --timeout <sec>            per-request HTTP timeout (default 15)
+  -y, --yes                  assume yes for confirmation prompts
 
 ${C_BOLD}ENVIRONMENT${C_RESET}
   NO_COLOR=1                 disable colours (same as --no-color)
@@ -894,6 +939,193 @@ mod_links() {
   return 0
 }
 
+# --- Module 10: Common Paths ----------------------------------------------
+# Probe a single path. Prints one tab separated line so parallel probes can
+# be merged without interleaving.
+paths_probe_one() {
+  local base="$1" path="$2" timeout="$3" follow="$4"
+  local -a cargs=(-s -o /dev/null -k --max-time "$timeout" --max-filesize 2097152
+                  -H "User-Agent: $USER_AGENT"
+                  -w '%{http_code}\t%{size_download}\t%{content_type}')
+  (( follow )) && cargs+=(-L)
+  local out='' code size ctype rest
+  out=$(curl "${cargs[@]}" -- "${base}${path}" 2>/dev/null || true)
+  [[ -z "$out" ]] && out=$'000\t0\t-'
+  code="${out%%$'\t'*}"
+  rest="${out#*$'\t'}"
+  size="${rest%%$'\t'*}"
+  ctype="${rest#*$'\t'}"
+  [[ -z "$ctype" ]] && ctype='-'
+  printf '%s\t%s\t%s\t%s\n' "$code" "$size" "$ctype" "$path"
+}
+
+# Probe every path in the wordlist, keeping at most <conc> requests in flight.
+paths_probe_all() {
+  local base="$1" wl="$2" conc="$3" timeout="$4" follow="$5"
+  local -a pids=()
+  local path
+  while IFS= read -r path || [[ -n "$path" ]]; do
+    path="${path%$'\r'}"
+    [[ -z "$path" ]] && continue
+    [[ "$path" == \#* ]] && continue
+    [[ "$path" != /* ]] && path="/${path}"
+    paths_probe_one "$base" "$path" "$timeout" "$follow" &
+    pids+=($!)
+    if (( ${#pids[@]} >= conc )); then
+      wait "${pids[0]}" 2>/dev/null || true
+      pids=("${pids[@]:1}")
+    fi
+  done < "$wl"
+  wait 2>/dev/null || true
+}
+
+mod_paths() {
+  local target="" wordlist='' conc=10 timeout=10 follow=1
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --wordlist)    wordlist="${2:-}"; shift 2 || shift ;;
+      --concurrency) conc="${2:-10}"; shift 2 || shift ;;
+      --timeout)     timeout="${2:-10}"; shift 2 || shift ;;
+      --no-follow)   follow=0; shift ;;
+      -y|--yes)      ASSUME_YES=1; shift ;;
+      -h|--help)
+        printf 'usage: digger.sh paths <url> [--wordlist FILE] [--concurrency N] [--timeout SEC] [--no-follow]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "COMMON PATHS"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Target URL or host")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+
+  # --- work out the base URL ----------------------------------------------
+  local base="$target" scheme=''
+  if [[ "$target" != http://* && "$target" != https://* ]]; then
+    scheme='https'
+  else
+    scheme="${target%%://*}"
+    base="$target"
+  fi
+  base="${base%/}"
+  local hostpart="${base#*://}"
+  hostpart="${hostpart%%/*}"
+  if ! is_hostname "$hostpart" && ! is_ip "$hostpart"; then
+    err "invalid target: ${target}"
+    return 1
+  fi
+
+  # Prefer whichever scheme actually answers.
+  local code
+  code=$(final_status "$base" 12)
+  if [[ ! "$code" =~ ^[1-5] ]] && [[ "$scheme" == 'https' ]]; then
+    local alt="http://${base#https://}"
+    if [[ "$(final_status "$alt" 12)" =~ ^[1-5] ]]; then
+      base="$alt"
+    fi
+  fi
+
+  info "Target: ${C_BOLD}${base}${C_RESET}"
+
+  # --- wordlist -----------------------------------------------------------
+  if [[ -z "$wordlist" ]]; then
+    wordlist=$(wordlist_file "paths.txt" || true)
+  fi
+  if [[ -z "$wordlist" || ! -f "$wordlist" ]]; then
+    err "no wordlist found (looked for wordlist/paths.txt)"
+    return 1
+  fi
+
+  local count
+  count=$(grep -cvE '^\s*(#|$)' "$wordlist" || true)
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+
+  printf '  Wordlist   : %s (%s paths)\n' "$wordlist" "$count"
+  printf '  Concurrency: %s   Timeout: %ss\n' "$conc" "$timeout"
+
+  # --- confirmation -------------------------------------------------------
+  if ! confirm "This sends ${count} active requests to ${base}. Continue?"; then
+    warn "aborted"
+    return 0
+  fi
+
+  local raw
+  raw=$(paths_probe_all "$base" "$wordlist" "$conc" "$timeout" "$follow")
+
+  # --- baseline (soft 404) detection ---------------------------------------
+  local top base_code='' base_size='' base_hits=0
+  top=$(printf '%s\n' "$raw" | awk -F'\t' 'NF>=2{print $1" "$2}' | sort | uniq -c | sort -rn | head -n1 || true)
+  if [[ -n "$top" ]]; then
+    base_hits=$(printf '%s' "$top" | awk '{print $1}')
+    base_code=$(printf '%s' "$top" | awk '{print $2}')
+    base_size=$(printf '%s' "$top" | awk '{print $3}')
+  fi
+
+  local -a found=() interesting=() soft=() missing=()
+  local line code size ctype path
+  while IFS=$'\t' read -r code size ctype path; do
+    [[ -z "$path" ]] && continue
+    case "$code" in
+      2*|3*) found+=("${code}|${size}|${ctype}|${path}") ;;
+      401|403|405) interesting+=("${code}|${size}|${ctype}|${path}") ;;
+      *)
+        if [[ -n "$base_code" && "$code" == "$base_code" && "$size" == "$base_size" ]]; then
+          soft+=("${code}|${size}|${ctype}|${path}")
+        else
+          missing+=("${code}|${size}|${ctype}|${path}")
+        fi
+        ;;
+    esac
+  done <<< "$raw"
+
+  printf '\n%sResults%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Probed %s paths, %s responded\n\n' "$count" "$((${#found[@]} + ${#interesting[@]} + ${#soft[@]} + ${#missing[@]}))"
+
+  local -a group
+  local title colour
+  for spec in "found:${C_GREEN}" "interesting:${C_YELLOW}" "soft:${C_DIM}" "missing:${C_DIM}"; do
+    title="${spec%%:*}"
+    colour="${spec#*:}"
+    case "$title" in
+      found)      group=("${found[@]}") ;;
+      interesting) group=("${interesting[@]}") ;;
+      soft)       group=("${soft[@]}") ;;
+      missing)    group=("${missing[@]}") ;;
+    esac
+    (( ${#group[@]} == 0 )) && continue
+    case "$title" in
+      found)       label="Found" ;;
+      interesting) label="Interesting" ;;
+      soft)        label="Not found (soft 404 baseline)" ;;
+      missing)     label="Other responses" ;;
+    esac
+    printf '%s%s%s (%s)\n' "$colour" "$label" "$C_RESET" "${#group[@]}"
+    local entry c s t p shown=0
+    for entry in "${group[@]}"; do
+      (( shown >= 30 )) && break
+      IFS='|' read -r c s t p <<< "$entry"
+      printf '  %s%-5s%s %-34s %10s  %s\n' "$colour" "$c" "$C_RESET" "$p" "$(human_size "$s")" "$t"
+      shown=$((shown + 1))
+    done
+    if (( ${#group[@]} > shown )); then
+      printf '  %s... and %s more%s\n' "$C_DIM" "$((${#group[@]} - shown))" "$C_RESET"
+    fi
+    printf '\n'
+  done
+  return 0
+}
+
 # --- Module 2: Info IP and Site -------------------------------------------
 mod_info() {
   local target="${1:-}"
@@ -1487,7 +1719,7 @@ menu() {
       7) mod_links ;;
       8) pending "subdomains" 14 ;;
       9) pending "archive" 9 ;;
-      10) pending "paths" 9 ;;
+      10) mod_paths ;;
       11) pending "tls" 10 ;;
       12) pending "cdn" 11 ;;
       13) pending "intel" 12 ;;
@@ -1508,6 +1740,7 @@ menu() {
 # ===========================================================================
 main() {
   init_colors
+  resolve_home || true
   PY="$(detect_python || true)"
   parse_args "$@"
 
@@ -1537,7 +1770,7 @@ main() {
     links)     mod_links ${rest[@]+"${rest[@]}"} ;;
     subdomains) pending "subdomains" 14 ;;
     archive)   pending "archive" 9 ;;
-    paths)     pending "paths" 9 ;;
+    paths)     mod_paths ${rest[@]+"${rest[@]}"} ;;
     tls)       pending "tls" 10 ;;
     cdn)       pending "cdn" 11 ;;
     intel)     pending "intel" 12 ;;

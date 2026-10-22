@@ -143,9 +143,20 @@ run links 'not a url at all!!'
 expect_match "links rejects garbage" 'no URL given|invalid'
 
 # ---------------------------------------------------------------------------
+section "module: paths"
+
+run paths https://example.com -y --wordlist "${ROOT}/tests/fixtures/paths-mini.txt" --concurrency 5 --timeout 10
+expect_match "paths reports a wordlist" 'Wordlist'
+expect_match "paths reports results" 'Results|Probed'
+expect_status "paths exits 0" 0
+
+run paths 'not a url at all!!'
+expect_match "paths rejects garbage" 'invalid target'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in scan hosts subdomains archive paths tls cdn intel secrets dorks social net; do
+for m in scan hosts subdomains archive tls cdn intel secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done

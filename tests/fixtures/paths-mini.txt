@@ -1,0 +1,6 @@
+# Mini wordlist used by the smoke tests so the path probe stays fast.
+/robots.txt
+/index.html
+/admin
+/.env
+/does-not-exist-zzz
