@@ -312,9 +312,24 @@ run dorks --help
 expect_match "dorks has its own usage" 'digger.sh dorks'
 
 # ---------------------------------------------------------------------------
+section "module: social"
+
+run social zzq9x7v3k1nope --timeout 8
+expect_match "social checks the platforms" 'SOCIAL FOOTPRINT'
+expect_match "social reports nothing for a random handle" 'Found \(0\)'
+expect_match "social prints a summary" 'Summary'
+expect_status "social runs" 0
+
+run social 'bad handle!!'
+expect_match "social rejects garbage" 'invalid handle'
+
+run social --help
+expect_match "social has its own usage" 'digger.sh social'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in social net; do
+for m in net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done

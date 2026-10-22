@@ -211,6 +211,7 @@ ${C_BOLD}COMMANDS${C_RESET}
   intel <ip|domain>          threat intel, DNSBL and blocklist lookups
   archive <domain|url>       archived snapshots, coverage and recent captures
   dorks <domain>             search engine dorks by category, offline
+  social <handle|domain>     username checks across public platforms
   secrets <url>              crawl a site and flag API keys, tokens and leaks
 
 ${C_BOLD}OPTIONS${C_RESET}
@@ -1033,6 +1034,210 @@ mod_links() {
     printf '\n%sExternal links%s (%s)\n' "$C_BOLD" "$C_RESET" "$(printf '%s\n' "$uniq_ext" | grep -c . || true)"
     printf '%s\n' "$uniq_ext" | sed 's/^/  /'
   fi
+  return 0
+}
+
+# --- Module 16: Social Footprint -------------------------------------------
+# Username checks against public profile pages: only platforms that answer
+# with a real 404 (or an unambiguous "no such user" page) are included.
+social_platforms() {
+  local h="$1"
+  cat <<EOF
+GitHub|https://github.com/${h}|
+Bitbucket|https://bitbucket.org/${h}|
+Keybase|https://keybase.io/${h}|
+Docker Hub|https://hub.docker.com/v2/users/${h}/|
+Dev.to|https://dev.to/${h}|
+YouTube|https://www.youtube.com/@${h}|
+SoundCloud|https://soundcloud.com/${h}|
+Vimeo|https://vimeo.com/${h}|
+Dribbble|https://dribbble.com/${h}|
+Behance|https://www.behance.net/${h}|
+Flickr|https://www.flickr.com/people/${h}/|
+Linktree|https://linktr.ee/${h}|
+About.me|https://about.me/${h}|
+Gravatar|https://gravatar.com/${h}.json|
+HackerOne|https://hackerone.com/${h}|
+Mastodon|https://mastodon.social/@${h}|
+X|https://x.com/${h}|
+Hacker News|https://news.ycombinator.com/user?id=${h}|No such user
+Steam|https://steamcommunity.com/id/${h}|could not be found
+Bluesky|https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=${h}.bsky.social|
+EOF
+}
+
+social_check_one() {
+  local label="$1" url="$2" marker="$3" timeout="$4"
+  local code body result
+  code=$(curl -sS -L -m "$timeout" -A "$USER_AGENT" -o /dev/null \
+    -w '%{http_code}' -- "$url" 2>/dev/null || true)
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code='000'
+  case "$code" in
+    # Bluesky answers 400 when a handle does not resolve.
+    200)          result='found' ;;
+    400|404|410)  result='missing' ;;
+    *)            result='unknown' ;;
+  esac
+  # Some sites return 200 for every name and explain the miss in the page.
+  if [[ "$result" == 'found' && -n "$marker" ]]; then
+    body=$(curl -sS -L -m "$timeout" -A "$USER_AGENT" -- "$url" 2>/dev/null \
+      | head -c 200000 || true)
+    if printf '%s' "$body" | grep -qiE -- "$marker"; then
+      result='missing'
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$label" "$url" "$code" "$result"
+}
+
+social_check_all() {
+  local timeout="$1" conc="$2"
+  shift 2
+  local -a pids=()
+  local line label url marker
+  for line in "$@"; do
+    IFS='|' read -r label url marker <<< "$line"
+    social_check_one "$label" "$url" "$marker" "$timeout" &
+    pids+=($!)
+    if (( ${#pids[@]} >= conc )); then
+      wait "${pids[0]}" 2>/dev/null || true
+      pids=("${pids[@]:1}")
+    fi
+  done
+  wait 2>/dev/null || true
+}
+
+mod_social() {
+  local target='' handle='' timeout=12 conc=8 verbose=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --handle)      handle="${2:-}"; shift 2 || shift ;;
+      --timeout)     timeout="${2:-12}"; shift 2 || shift ;;
+      --concurrency) conc="${2:-8}"; shift 2 || shift ;;
+      --verbose)     verbose=1; shift ;;
+      -h|--help)
+        printf 'usage: digger.sh social <handle|domain> [--handle NAME] [--timeout SEC] [--concurrency N] [--verbose]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "SOCIAL FOOTPRINT"
+  hr 60
+
+  if [[ -z "$target" && -z "$handle" ]]; then
+    target=$(prompt "Username or domain")
+  fi
+
+  [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout > 0 )) || timeout=12
+  [[ "$conc" =~ ^[0-9]+$ ]] && (( conc > 0 )) || conc=8
+
+  local derived=0 t
+  if [[ -z "$handle" ]]; then
+    t="${target// /}"
+    t="${t#*://}"
+    t="${t%%/*}"
+    t="${t%%:*}"
+    t="${t%.}"
+    t="${t,,}"
+    if [[ -z "$t" ]]; then
+      err "no handle given"
+      return 1
+    fi
+    if [[ "$t" == *.* ]] && is_hostname "$t"; then
+      t="${t#www.}"
+      handle="${t%%.*}"
+      derived=1
+    else
+      handle="$t"
+    fi
+  fi
+
+  if [[ ! "$handle" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+    err "invalid handle: ${handle}"
+    return 1
+  fi
+
+  local platforms_raw
+  platforms_raw=$(social_platforms "$handle")
+  local -a platforms=()
+  mapfile -t platforms < <(printf '%s\n' "$platforms_raw" | grep -v '^$' || true)
+
+  info "Handle: ${C_BOLD}${handle}${C_RESET}"
+  if (( derived )); then
+    printf '  Derived     : from the domain, pass --handle to check someone else\n'
+  fi
+  printf '  Platforms   : %s %s(public profile pages, no login)%s\n' \
+    "${#platforms[@]}" "$C_DIM" "$C_RESET"
+
+  printf '\n  %schecking %s platforms...%s\n' "$C_DIM" "${#platforms[@]}" "$C_RESET"
+  local raw
+  raw=$(social_check_all "$timeout" "$conc" "${platforms[@]}")
+
+  local -A res_state=() res_code=()
+  local label url marker code state
+  while IFS=$'\t' read -r label url code state; do
+    [[ -z "$label" ]] && continue
+    res_state["$label"]="$state"
+    res_code["$label"]="$code"
+  done <<< "$raw"
+
+  local -a found=() missing=() unknown=()
+  while IFS='|' read -r label url marker || [[ -n "$label" ]]; do
+    [[ -z "$label" ]] && continue
+    state="${res_state[$label]:-unknown}"
+    code="${res_code[$label]:-000}"
+    case "$state" in
+      found)   found+=("${label}|${url}|${code}") ;;
+      missing) missing+=("${label}|${url}|${code}") ;;
+      *)       unknown+=("${label}|${url}|${code}") ;;
+    esac
+  done <<< "$platforms_raw"
+
+  local item l u c names
+
+  printf '\n%sFound%s (%s)\n' "$C_GREEN" "$C_RESET" "${#found[@]}"
+  if (( ${#found[@]} == 0 )); then
+    printf '  %snothing under this handle%s\n' "$C_DIM" "$C_RESET"
+  fi
+  for item in ${found[@]+"${found[@]}"}; do
+    IFS='|' read -r l u c <<< "$item"
+    printf '  %s%-12s%s %s\n' "$C_GREEN" "$l" "$C_RESET" "$u"
+  done
+
+  printf '\n%sNot found%s (%s)\n' "$C_DIM" "$C_RESET" "${#missing[@]}"
+  if (( verbose )); then
+    for item in ${missing[@]+"${missing[@]}"}; do
+      IFS='|' read -r l u c <<< "$item"
+      printf '  %-12s %-52s %s\n' "$l" "$u" "$c"
+    done
+  elif (( ${#missing[@]} > 0 )); then
+    names=''
+    for item in "${missing[@]}"; do
+      names="${names}${item%%|*}, "
+    done
+    printf '%s\n' "${names%, }" | fold -s -w 72 | sed -E 's/[[:space:]]+$//; s/^/  /'
+  else
+    printf '  none\n'
+  fi
+
+  if (( ${#unknown[@]} > 0 )); then
+    printf '\n%sBlocked or unverifiable%s (%s)\n' "$C_YELLOW" "$C_RESET" "${#unknown[@]}"
+    for item in "${unknown[@]}"; do
+      IFS='|' read -r l u c <<< "$item"
+      printf '  %-12s %-52s %s\n' "$l" "$u" "$c"
+    done
+    printf '  %srate limits and login walls, try again later%s\n' "$C_DIM" "$C_RESET"
+  fi
+
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Handle   : %s\n' "$handle"
+  printf '  Checked  : %s\n' "${#platforms[@]}"
+  printf '  Found    : %s\n' "${#found[@]}"
+  printf '  Missing  : %s\n' "${#missing[@]}"
+  printf '  Unknown  : %s\n' "${#unknown[@]}"
   return 0
 }
 
@@ -4518,7 +4723,7 @@ menu() {
       13) mod_intel ;;
       14) mod_secrets ;;
       15) mod_dorks ;;
-      16) pending "social" 19 ;;
+      16) mod_social ;;
       17) pending "net" 20 ;;
       0) printf '\n%sbye%s\n' "$C_DIM" "$C_RESET"; return 0 ;;
       '') : ;;
@@ -4569,7 +4774,7 @@ main() {
     intel)     mod_intel ${rest[@]+"${rest[@]}"} ;;
     secrets)   mod_secrets ${rest[@]+"${rest[@]}"} ;;
     dorks)     mod_dorks ${rest[@]+"${rest[@]}"} ;;
-    social)    pending "social" 19 ;;
+    social)    mod_social ${rest[@]+"${rest[@]}"} ;;
     net)       pending "net" 20 ;;
     modules)   module_registry ;;
     menu)      show_banner; menu ;;
