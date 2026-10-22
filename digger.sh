@@ -198,22 +198,22 @@ ${C_BOLD}USAGE${C_RESET}
 
 ${C_BOLD}COMMANDS${C_RESET}
   myip                       your public IP, geo, ISP and ASN
-  dns <domain|ip>            DNS records for a domain (A AAAA MX NS TXT CNAME SOA CAA)
   info <ip|host>             deep dive on an IP address or a website
+  dns <domain|ip>            DNS records for a domain (A AAAA MX NS TXT CNAME SOA CAA)
+  scan <host|ip>             TCP port scan (nmap -sT, or a /dev/tcp fallback)
+  hosts <domain|ip>          reverse hosts on an address, optional vhost probing
   domain <domain>            registration data for a domain
   links <url>                crawl a site and list every link it finds
   subdomains <domain>        passive subdomains, wordlist and pattern guessing
-  hosts <domain|ip>          reverse hosts on an address, optional vhost probing
-  scan <host|ip>             TCP port scan (nmap -sT, or a /dev/tcp fallback)
+  archive <domain|url>       archived snapshots, coverage and recent captures
   paths <url>                probe common paths and sensitive files
   tls <host[:port]>          certificates, protocol versions and ciphers
   cdn <domain|url>           CDN and WAF detection
   intel <ip|domain>          threat intel, DNSBL and blocklist lookups
-  archive <domain|url>       archived snapshots, coverage and recent captures
+  secrets <url>              crawl a site and flag API keys, tokens and leaks
   dorks <domain>             search engine dorks by category, offline
   social <handle|domain>     username checks across public platforms
   net <host|ip>              traceroute with ASN and network labels
-  secrets <url>              crawl a site and flag API keys, tokens and leaks
 
 ${C_BOLD}OPTIONS${C_RESET}
   -h, --help                 this help
@@ -229,7 +229,9 @@ ${C_BOLD}ENVIRONMENT${C_RESET}
   HTTP_TIMEOUT=15            per-request timeout in seconds
 
 ${C_BOLD}DEPENDENCIES${C_RESET}
-  curl dig jq (or python3) openssl nmap whois
+  required    curl bash 4.3+
+  json        jq, or python3 as a fallback for every json source
+  optional    dig, nmap, openssl, whois, traceroute, mtr, ping
 EOF
 }
 
@@ -4991,26 +4993,22 @@ cmd() {
 module_registry() {
   printf '\n%sModules%s\n' "$C_BOLD" "$C_RESET"
   cmd myip 3 "public IP, geo, ISP and ASN"
-  cmd dns 4 "DNS records for a domain"
   cmd info 5 "info IP and site"
+  cmd dns 4 "DNS records for a domain"
+  cmd scan 16 "port scanner"
+  cmd hosts 15 "host finder (IP pivot)"
   cmd domain 6 "domain registration info"
   cmd links 7 "extract links (recursive crawl)"
+  cmd subdomains 14 "subdomain finder"
+  cmd archive 18 "historical snapshots (wayback)"
   cmd paths 9 "common paths and sensitive files"
   cmd tls 10 "TLS inspector"
   cmd cdn 11 "CDN and WAF detection"
   cmd intel 12 "threat intel and DNSBL"
-  cmd subdomains 14 "subdomain finder"
-  cmd archive 18 "historical snapshots (wayback)"
-  cmd hosts 15 "host finder (IP pivot)"
-  cmd scan 16 "port scanner"
   cmd secrets 17 "API and secret discovery"
   cmd dorks 19 "search dork generator"
   cmd social 20 "social footprint"
   cmd net 21 "network path"
-}
-pending() {
-  local name="$1" step="$2"
-  warn "module '${name}' is not implemented yet (planned for build step ${step})"
 }
 
 # ===========================================================================
