@@ -209,6 +209,7 @@ ${C_BOLD}COMMANDS${C_RESET}
   tls <host[:port]>          certificates, protocol versions and ciphers
   cdn <domain|url>           CDN and WAF detection
   intel <ip|domain>          threat intel, DNSBL and blocklist lookups
+  secrets <url>              crawl a site and flag API keys, tokens and leaks
 
 ${C_BOLD}OPTIONS${C_RESET}
   -h, --help                 this help
@@ -762,9 +763,14 @@ url_join() {
   local base="$1" href="$2" out=''
   href="${href%%#*}"
   [[ -z "$href" ]] && return 1
+  # Values travel through the environment with a one character prefix: MSYS
+  # (Git Bash on Windows) rewrites arguments that look like absolute POSIX
+  # paths, so "/app.js" would otherwise become "C:/Program Files/Git/app.js"
+  # before python sees it.
   if [[ -n "$PY" ]]; then
-    out=$("$PY" -c 'import sys,urllib.parse;print(urllib.parse.urljoin(sys.argv[1],sys.argv[2]))' \
-      "$base" "$href" 2>/dev/null || true)
+    out=$(JOIN_BASE="x${base}" JOIN_HREF="x${href}" "$PY" -c \
+      'import os,urllib.parse as u;b=os.environ["JOIN_BASE"][1:];h=os.environ["JOIN_HREF"][1:];print(u.urljoin(b,h))' \
+      2>/dev/null || true)
     if [[ -n "$out" ]]; then
       printf '%s' "$out"
       return 0
@@ -3161,6 +3167,329 @@ mod_scan() {
   return 0
 }
 
+# --- Module 14: API and Secret Discovery -----------------------------------
+SECRET_LEVELS=()
+SECRET_LABELS=()
+SECRET_REGEXES=()
+SECRET_COMBINED=''
+
+secrets_pattern() {
+  SECRET_LEVELS+=("$1")
+  SECRET_LABELS+=("$2")
+  SECRET_REGEXES+=("$3")
+  if [[ -n "$SECRET_COMBINED" ]]; then
+    SECRET_COMBINED="${SECRET_COMBINED}|(${3})"
+  else
+    SECRET_COMBINED="(${3})"
+  fi
+}
+
+secrets_init_patterns() {
+  (( ${#SECRET_REGEXES[@]} > 0 )) && return 0
+
+  # High confidence: the string only makes sense as a live credential.
+  secrets_pattern high "private key block" \
+    '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+  secrets_pattern high "AWS access key id" \
+    'AKIA[0-9A-Z]{16}'
+  secrets_pattern high "AWS temporary key id" \
+    'ASIA[0-9A-Z]{16}'
+  secrets_pattern high "AWS secret access key" \
+    'aws_secret_access_key[^A-Za-z0-9]{0,6}[:=][^A-Za-z0-9]{0,3}[A-Za-z0-9/+=]{40}'
+  secrets_pattern high "Google API key" \
+    'AIza[0-9A-Za-z_-]{35}'
+  secrets_pattern high "GitHub token" \
+    'gh[pousr]_[A-Za-z0-9]{36,}'
+  secrets_pattern high "GitHub fine grained token" \
+    'github_pat_[A-Za-z0-9_]{22,}'
+  secrets_pattern high "Slack token" \
+    'xox[baprs]-[0-9A-Za-z-]{10,}'
+  secrets_pattern high "Stripe live key" \
+    'sk_live_[0-9A-Za-z]{20,}'
+  secrets_pattern high "SendGrid key" \
+    'SG[.][A-Za-z0-9_-]{16,}[.][A-Za-z0-9_-]{16,}'
+  secrets_pattern high "Mailgun key" \
+    'key-[0-9a-zA-Z]{32}\b'
+  secrets_pattern high "npm token" \
+    'npm_[A-Za-z0-9]{36}'
+  secrets_pattern high "Shopify token" \
+    'shp(at|ca|pa)_[0-9a-fA-F]{32}'
+  secrets_pattern high "Discord webhook" \
+    'discord[.]com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+'
+  secrets_pattern high "OpenAI style key" \
+    'sk-(proj-)?[A-Za-z0-9]{32,}'
+
+  # Medium: credential shaped, but common in public code too.
+  secrets_pattern medium "Twilio account SID" \
+    'AC[0-9a-f]{32}'
+  secrets_pattern medium "Twilio API key" \
+    'SK[0-9a-f]{32}'
+  secrets_pattern medium "JSON web token" \
+    'eyJ[A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{5,}'
+  secrets_pattern medium "bearer token" \
+    'Bearer[[:space:]]+[A-Za-z0-9_.=+/-]{20,}'
+  secrets_pattern medium "credential in URL" \
+    'https?://[^/[:space:]:@]+:[^/[:space:]:@]+@'
+  secrets_pattern medium "api key assignment" \
+    '(api[_-]?key|apikey|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key)[^A-Za-z0-9]{0,6}[:=][^A-Za-z0-9]{0,3}[A-Za-z0-9_./+=-]{16,}'
+  secrets_pattern medium "firebase database" \
+    'https?://[A-Za-z0-9-]+[.]firebaseio[.]com'
+  secrets_pattern medium "S3 bucket URL" \
+    '[A-Za-z0-9._-]+[.]s3[.-][A-Za-z0-9-]*[.]?amazonaws[.]com'
+  secrets_pattern medium "Azure blob storage" \
+    '[A-Za-z0-9]{3,24}[.]blob[.]core[.]windows[.]net'
+
+  # Low: not secrets, but useful leads for the next step.
+  secrets_pattern low "internal IP" \
+    '\b10([.][0-9]{1,3}){3}\b|\b192[.]168([.][0-9]{1,3}){2}\b|\b172[.](1[6-9]|2[0-9]|3[01])([.][0-9]{1,3}){2}\b'
+  secrets_pattern low "API path" \
+    '/(api|rest|graphql|v[0-9]+)/[A-Za-z0-9_./{}-]{2,}'
+  secrets_pattern low "source map" \
+    '[A-Za-z0-9._/-]+[.]js[.]map'
+}
+
+# Show enough of a value to recognise it without dumping the whole secret.
+# URLs, paths and key headers are locations, not credentials, so they stay
+# readable; everything else is truncated.
+secrets_mask() {
+  local s="$1"
+  case "$s" in
+    *://*|/*|'-----BEGIN'*) printf '%s' "$s"; return 0 ;;
+  esac
+  if (( ${#s} > 16 )); then
+    printf '%s...%s' "${s:0:6}" "${s: -4}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+mod_secrets() {
+  local target='' depth=2 maxpages=10 maxscripts=25 delay=0.2
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --depth)       depth="${2:-2}"; shift 2 || shift ;;
+      --max-pages)   maxpages="${2:-10}"; shift 2 || shift ;;
+      --max-scripts) maxscripts="${2:-25}"; shift 2 || shift ;;
+      --delay)       delay="${2:-0.2}"; shift 2 || shift ;;
+      -y|--yes)      ASSUME_YES=1; shift ;;
+      -h|--help)
+        printf 'usage: digger.sh secrets <url> [--depth N] [--max-pages N] [--max-scripts N] [--delay S]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "API AND SECRET DISCOVERY"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Start URL")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no URL given"
+    return 1
+  fi
+  [[ "$target" != http://* && "$target" != https://* ]] && target="https://${target}"
+  target="${target%/}"
+
+  local hostpart="${target#*://}"
+  hostpart="${hostpart%%/*}"
+  hostpart="${hostpart%%:*}"
+  if ! is_hostname "$hostpart" && ! is_ip "$hostpart"; then
+    err "invalid URL: ${target}"
+    return 1
+  fi
+
+  [[ "$depth" =~ ^[0-9]+$ ]] || depth=2
+  [[ "$maxpages" =~ ^[0-9]+$ ]] && (( maxpages > 0 )) || maxpages=10
+  [[ "$maxscripts" =~ ^[0-9]+$ ]] || maxscripts=25
+  [[ "$delay" =~ ^[0-9.]+$ ]] || delay=0.2
+
+  secrets_init_patterns
+
+  info "Target: ${C_BOLD}${target}${C_RESET}"
+  printf '  Limits      : depth %s, %s pages, %s scripts\n' \
+    "$depth" "$maxpages" "$maxscripts"
+  printf '  Patterns    : %s (high %s, medium %s, low %s)\n' \
+    "${#SECRET_REGEXES[@]}" \
+    "$(printf '%s\n' "${SECRET_LEVELS[@]}" | grep -c '^high$' || true)" \
+    "$(printf '%s\n' "${SECRET_LEVELS[@]}" | grep -c '^medium$' || true)" \
+    "$(printf '%s\n' "${SECRET_LEVELS[@]}" | grep -c '^low$' || true)"
+
+  if ! confirm "This fetches pages and scripts from ${target}. Continue?"; then
+    warn "aborted"
+    return 0
+  fi
+
+  # --- crawl --------------------------------------------------------------
+  local base_host base_suffix
+  base_host=$(url_host "$target")
+  base_suffix="$base_host"
+  if [[ "$base_host" == *.*.* ]]; then
+    base_suffix="${base_host#*.}"
+  fi
+
+  local -A seen_page=()
+  local -a queue=("0|${target}") corpus_urls=() corpus_bodies=() script_urls=()
+  local -A seen_script=()
+  local pages_n=0 scripts_n=0
+  local entry d u body link abs ahost ext
+
+  printf '\n  %sfetching pages...%s\n' "$C_DIM" "$C_RESET"
+  while (( ${#queue[@]} > 0 )); do
+    entry="${queue[0]}"
+    queue=("${queue[@]:1}")
+    d="${entry%%|*}"
+    u="${entry#*|}"
+    (( d > depth )) && continue
+    [[ -n "${seen_page[$u]:-}" ]] && continue
+    (( pages_n >= maxpages )) && break
+    seen_page["$u"]=1
+    body=$(page_body "$u" 400000)
+    [[ -z "$body" ]] && continue
+    pages_n=$((pages_n + 1))
+    corpus_urls+=("$u")
+    corpus_bodies+=("$body")
+
+    while IFS= read -r link; do
+      [[ -z "$link" ]] && continue
+      case "${link,,}" in
+        javascript:*|mailto:*|tel:*|data:*|about:*|ftp:*|blob:*|file:*|'#'*) continue ;;
+      esac
+      abs=$(url_join "$u" "$link" || true)
+      [[ -z "$abs" ]] && continue
+      case "$abs" in http://*|https://*) ;; *) continue ;; esac
+      abs="${abs%%#*}"
+      ext="${abs%%\?*}"
+      ahost=$(url_host "$abs")
+      if [[ "${ext,,}" == *.js || "${ext,,}" == *.mjs ]]; then
+        # Only own scripts: a third party CDN bundle is noise and we should
+        # not go pulling files off unrelated hosts.
+        if [[ "$ahost" == "$base_host" || "$ahost" == *".${base_suffix}" ]]; then
+          if [[ -z "${seen_script[$abs]:-}" ]] && (( ${#script_urls[@]} < maxscripts )); then
+            seen_script["$abs"]=1
+            script_urls+=("$abs")
+          fi
+        fi
+        continue
+      fi
+      if [[ "$ahost" == "$base_host" ]] && (( d < depth )) && [[ -z "${seen_page[$abs]:-}" ]]; then
+        queue+=("$((d + 1))|${abs}")
+      fi
+    done < <(extract_links "$body")
+
+    if gt_zero "$delay"; then sleep "$delay"; fi
+  done
+
+  if (( pages_n == 0 )); then
+    warn "could not fetch any page from ${target}"
+    return 1
+  fi
+
+  local su sbody
+  if (( ${#script_urls[@]} > 0 )); then
+    printf '  %sfetching %s scripts...%s\n' "$C_DIM" "${#script_urls[@]}" "$C_RESET"
+    for su in ${script_urls[@]+"${script_urls[@]}"}; do
+      sbody=$(page_body "$su" 600000)
+      [[ -z "$sbody" ]] && continue
+      scripts_n=$((scripts_n + 1))
+      corpus_urls+=("$su")
+      corpus_bodies+=("$sbody")
+    done
+  fi
+
+  if (( scripts_n < ${#script_urls[@]} )); then
+    printf '  %s%s of %s scripts could not be fetched%s\n' \
+      "$C_DIM" "$(( ${#script_urls[@]} - scripts_n ))" "${#script_urls[@]}" "$C_RESET"
+  fi
+
+  # --- scan ---------------------------------------------------------------
+  local -A seen_find=()
+  local -a high=() medium=() low=()
+  local i j label level value key matches m
+  local total_matches=0
+
+  for i in "${!corpus_urls[@]}"; do
+    matches=$(printf '%s' "${corpus_bodies[$i]}" \
+      | grep -oiE -- "$SECRET_COMBINED" 2>/dev/null \
+      | head -n 400 | sort -u || true)
+    [[ -z "$matches" ]] && continue
+    while IFS= read -r m; do
+      [[ -z "$m" ]] && continue
+      total_matches=$((total_matches + 1))
+      (( total_matches > 400 )) && break
+      # Keep the pipe used as the field separator out of the stored value.
+      m="${m//$'\t'/ }"
+      m="${m//|/-}"
+      label=''
+      level=''
+      for j in "${!SECRET_REGEXES[@]}"; do
+        if [[ "$m" =~ ${SECRET_REGEXES[$j]} ]]; then
+          label="${SECRET_LABELS[$j]}"
+          level="${SECRET_LEVELS[$j]}"
+          break
+        fi
+      done
+      [[ -z "$label" ]] && continue
+      value=$(secrets_mask "$m")
+      key="${level}|${label}|${value}|${corpus_urls[$i]}"
+      [[ -n "${seen_find[$key]:-}" ]] && continue
+      seen_find["$key"]=1
+      case "$level" in
+        high)   high+=("${label}|${value}|${corpus_urls[$i]}") ;;
+        medium) medium+=("${label}|${value}|${corpus_urls[$i]}") ;;
+        *)      low+=("${label}|${value}|${corpus_urls[$i]}") ;;
+      esac
+    done <<< "$matches"
+  done
+
+  # --- findings -----------------------------------------------------------
+  printf '\n%sFindings%s\n' "$C_BOLD" "$C_RESET"
+  printf '  crawled %s pages and %s scripts, %s candidate strings\n' \
+    "$pages_n" "$scripts_n" "$total_matches"
+
+  local -a entries=()
+  local colour title item l v s shown
+  for spec in "high:${C_RED}:HIGH" "medium:${C_YELLOW}:MEDIUM" "low:${C_DIM}:LOW"; do
+    IFS=':' read -r level colour title <<< "$spec"
+    case "$level" in
+      high)   entries=(${high[@]+"${high[@]}"}) ;;
+      medium) entries=(${medium[@]+"${medium[@]}"}) ;;
+      low)    entries=(${low[@]+"${low[@]}"}) ;;
+    esac
+    printf '\n%s%s%s (%s)\n' "$colour" "$title" "$C_RESET" "${#entries[@]}"
+    if (( ${#entries[@]} == 0 )); then
+      printf '  %snone%s\n' "$C_DIM" "$C_RESET"
+      continue
+    fi
+    shown=0
+    for item in "${entries[@]}"; do
+      (( shown >= 30 )) && break
+      IFS='|' read -r l v s <<< "$item"
+      printf '  %-26s %-30s %s\n' "$l" "$v" "$s"
+      shown=$((shown + 1))
+    done
+    if (( ${#entries[@]} > shown )); then
+      printf '  %s... and %s more%s\n' "$C_DIM" "$(( ${#entries[@]} - shown ))" "$C_RESET"
+    fi
+  done
+
+  # --- summary ------------------------------------------------------------
+  printf '\n%sSummary%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Pages    : %s\n' "$pages_n"
+  printf '  Scripts  : %s\n' "$scripts_n"
+  printf '  High     : %s\n' "${#high[@]}"
+  printf '  Medium   : %s\n' "${#medium[@]}"
+  printf '  Low      : %s\n' "${#low[@]}"
+  printf '  %slong values are truncated, confirm by hand before reporting%s\n' \
+    "$C_DIM" "$C_RESET"
+  return 0
+}
+
 mod_info() {
   local target="${1:-}"
 
@@ -3770,7 +4099,7 @@ menu() {
       11) mod_tls ;;
       12) mod_cdn ;;
       13) mod_intel ;;
-      14) pending "secrets" 17 ;;
+      14) mod_secrets ;;
       15) pending "dorks" 18 ;;
       16) pending "social" 19 ;;
       17) pending "net" 20 ;;
@@ -3821,7 +4150,7 @@ main() {
     tls)       mod_tls ${rest[@]+"${rest[@]}"} ;;
     cdn)       mod_cdn ${rest[@]+"${rest[@]}"} ;;
     intel)     mod_intel ${rest[@]+"${rest[@]}"} ;;
-    secrets)   pending "secrets" 17 ;;
+    secrets)   mod_secrets ${rest[@]+"${rest[@]}"} ;;
     dorks)     pending "dorks" 18 ;;
     social)    pending "social" 19 ;;
     net)       pending "net" 20 ;;

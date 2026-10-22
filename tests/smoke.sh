@@ -30,7 +30,7 @@ c_fail() { printf '  %sFAIL%s  %s\n' "$R" "$N" "$1"; FAIL=$((FAIL + 1)); }
 c_skip() { printf '  %sSKIP%s  %s\n' "$Y" "$N" "$1"; SKIP=$((SKIP + 1)); }
 
 run() {
-  OUT="$(bash "$DIGGER" "$@" 2>&1)"
+  OUT="$(bash "$DIGGER" "$@" 2>&1 < /dev/null)"
   RC=$?
 }
 
@@ -247,9 +247,26 @@ run scan --help
 expect_match "scan has its own usage" 'digger.sh scan'
 
 # ---------------------------------------------------------------------------
+section "module: secrets"
+
+run secrets 'http://bad host!!'
+expect_match "secrets rejects garbage" 'invalid URL'
+
+run secrets http://example.com
+expect_match "secrets asks before crawling" 'aborted'
+expect_status "secrets refuses to crawl without consent" 0
+
+run secrets http://127.0.0.1:1/ -y --max-pages 1
+expect_match "secrets reports an unreachable target" 'could not fetch any page'
+expect_status "secrets fails cleanly when nothing is reachable" 1
+
+run secrets --help
+expect_match "secrets has its own usage" 'digger.sh secrets'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in archive secrets dorks social net; do
+for m in archive dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done
