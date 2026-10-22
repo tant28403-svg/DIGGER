@@ -9,3 +9,7 @@
 # No line-ending translation for these
 LICENSE text eol=lf
 README.md text eol=lf
+
+# Wordlists are read by the tool, keep them LF so no stray CR is parsed
+wordlist/*.txt text eol=lf
+tests/fixtures/*.txt text eol=lf

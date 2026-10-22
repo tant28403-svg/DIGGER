@@ -1126,6 +1126,267 @@ mod_paths() {
   return 0
 }
 
+read -r -d '' PY_PARSE_DATE <<'PYEOF' || true
+import sys, time, calendar
+try:
+    sys.stdout.reconfigure(newline='\n')
+except Exception:
+    pass
+s = sys.argv[1].strip()
+if s.endswith('GMT'):
+    s = s[:-3].strip()
+for fmt in ('%b %d %H:%M:%S %Y', '%b %d %H:%M:%S %Y %Z', '%Y-%m-%dT%H:%M:%S'):
+    try:
+        print(int(calendar.timegm(time.strptime(s, fmt))))
+        break
+    except Exception:
+        continue
+PYEOF
+
+# Days between now and a certificate notAfter date. Negative means expired.
+tls_days_until() {
+  local enddate="$1" end_epoch='' now
+  now=$(date +%s 2>/dev/null || printf '0')
+  end_epoch=$(date -d "$enddate" +%s 2>/dev/null || true)
+  if [[ -z "$end_epoch" ]] && [[ -n "$PY" ]]; then
+    end_epoch=$("$PY" -c "$PY_PARSE_DATE" "$enddate" 2>/dev/null || true)
+  fi
+  [[ -z "$end_epoch" ]] && return 1
+  printf '%s' "$(( (end_epoch - now) / 86400 ))"
+}
+
+# Raw openssl handshake output for a host and port.
+tls_handshake() {
+  local host="$1" port="$2" extra="${3:-}"
+  # shellcheck disable=SC2086
+  timeout 20 openssl s_client -connect "${host}:${port}" -servername "$host" $extra </dev/null 2>/dev/null || true
+}
+
+# The leaf certificate, PEM encoded.
+tls_leaf_cert() {
+  local host="$1" port="$2"
+  tls_handshake "$host" "$port" "-showcerts" \
+    | awk '/-----BEGIN CERTIFICATE-----/{f=1} f{print} /-----END CERTIFICATE-----/{exit}'
+}
+
+# Test one protocol version. Local OpenSSL builds often disable TLS 1.0 and
+# 1.1 at the default security level, so retry with the level lowered before
+# declaring the protocol unsupported.
+tls_protocol_test() {
+  local host="$1" port="$2" flag="$3" out=''
+  out=$(timeout 15 openssl s_client -connect "${host}:${port}" -servername "$host" "-${flag}" </dev/null 2>&1 || true)
+  if printf '%s' "$out" | grep -q 'no protocols available\|no ciphers available'; then
+    out=$(timeout 15 openssl s_client -connect "${host}:${port}" -servername "$host" "-${flag}" \
+      -cipher 'ALL:@SECLEVEL=0' </dev/null 2>&1 || true)
+  fi
+  printf '%s' "$out"
+}
+
+# Extract the negotiated cipher from an openssl handshake dump. OpenSSL 3.x
+# prints it in the session block for TLS 1.2 and older, and in the handshake
+# summary line for TLS 1.3.
+tls_cipher_of() {
+  local out="$1" c=''
+  c=$(printf '%s' "$out" | grep -m1 '^ *Cipher *:' | sed -E 's/^ *Cipher *: *//' || true)
+  if [[ -z "$c" || "$c" == '0000' || "$c" == '(NONE)' ]]; then
+    c=$(printf '%s' "$out" | grep -m1 'Cipher is ' | sed -E 's/.*Cipher is //' || true)
+  fi
+  [[ "$c" == '0000' || "$c" == '(NONE)' ]] && c=''
+  printf '%s' "$c"
+}
+
+tls_proto_of() {
+  local out="$1" p=''
+  p=$(printf '%s' "$out" | grep -m1 '^ *Protocol *:' | sed -E 's/^ *Protocol *: *//' || true)
+  printf '%s' "$p"
+}
+
+# Does the subject alternative name list cover this host?
+tls_covers_host() {
+  local san="$1" host="$2" n suffix
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    if [[ "$n" == "$host" ]]; then return 0; fi
+    if [[ "$n" == '*.'* ]]; then
+      suffix="${n#*.}"
+      if [[ "$host" == *".${suffix}" ]]; then return 0; fi
+    fi
+  done < <(printf '%s' "$san" | tr ',' '\n' \
+    | sed -E 's/^[[:space:]]*DNS://I; s/^[[:space:]]*//; s/[[:space:]]*$//')
+  return 1
+}
+
+# --- Module 11: TLS Inspector ----------------------------------------------
+mod_tls() {
+  local target='' port=443
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --port) port="${2:-443}"; shift 2 || shift ;;
+      -h|--help)
+        printf 'usage: digger.sh tls <host[:port]>\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "TLS INSPECTOR"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Host")
+  fi
+  target="${target// /}"
+  target="${target,,}"
+
+  if [[ -z "$target" ]]; then
+    err "no target given"
+    return 1
+  fi
+
+  local host="$target"
+  if [[ "$host" == *:* && "$host" != *:*:* ]]; then
+    port="${host##*:}"
+    host="${host%:*}"
+  fi
+  if ! is_hostname "$host" && ! is_ip "$host"; then
+    err "invalid host: ${target}"
+    return 1
+  fi
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    err "invalid port: ${port}"
+    return 1
+  fi
+
+  if ! have openssl; then
+    err "openssl is required for the TLS inspector"
+    return 1
+  fi
+
+  info "Target: ${C_BOLD}${host}:${port}${C_RESET}"
+
+  local chain
+  chain=$(tls_handshake "$host" "$port" "-showcerts")
+  if [[ -z "$chain" ]] || ! printf '%s' "$chain" | grep -q 'BEGIN CERTIFICATE'; then
+    err "no TLS service on ${host}:${port}"
+    return 1
+  fi
+
+  # --- connection ---------------------------------------------------------
+  local proto cipher chain_len
+  proto=$(tls_proto_of "$chain")
+  cipher=$(tls_cipher_of "$chain")
+  chain_len=$(printf '%s' "$chain" | grep -c -- '-----BEGIN CERTIFICATE' || true)
+
+  printf '\n%sConnection%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Protocol        : %s\n' "${proto:-unknown}"
+  printf '  Cipher          : %s\n' "${cipher:-unknown}"
+  printf '  Chain length    : %s\n' "$chain_len"
+  printf '  Local OpenSSL   : %s\n' "$(openssl version 2>/dev/null | awk '{print $1" "$2}' || echo unknown)"
+
+  # --- leaf certificate ---------------------------------------------------
+  local cert
+  cert=$(tls_leaf_cert "$host" "$port")
+  if [[ -z "$cert" ]]; then
+    warn "could not read the leaf certificate"
+    return 0
+  fi
+
+  local subject issuer notbefore notafter serial fp keyinfo sigalg san certtext
+  subject=$(printf '%s' "$cert" | openssl x509 -noout -subject 2>/dev/null | sed 's/^subject=//; s/^ *//' || true)
+  issuer=$(printf '%s' "$cert" | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//; s/^ *//' || true)
+  notbefore=$(printf '%s' "$cert" | openssl x509 -noout -startdate 2>/dev/null | sed 's/^notBefore=//' || true)
+  notafter=$(printf '%s' "$cert" | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || true)
+  serial=$(printf '%s' "$cert" | openssl x509 -noout -serial 2>/dev/null | sed 's/^serial=//' || true)
+  fp=$(printf '%s' "$cert" | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' || true)
+  certtext=$(printf '%s' "$cert" | openssl x509 -noout -text 2>/dev/null || true)
+  keyinfo=$(printf '%s' "$certtext" | grep -m1 -i 'Public-Key:' | sed 's/^ *//' || true)
+  sigalg=$(printf '%s' "$certtext" | grep -m1 -i 'Signature Algorithm:' | sed 's/^ *//' || true)
+  san=$(printf '%s' "$cert" | openssl x509 -noout -ext subjectAltName 2>/dev/null | tail -n1 | sed 's/^ *//' || true)
+
+  # friendlier key description
+  local keydesc="$keyinfo"
+  if printf '%s' "$certtext" | grep -qi 'id-ecPublicKey'; then
+    keydesc="EC $(printf '%s' "$keyinfo" | grep -oE '[0-9]+ bit' || true)"
+  elif printf '%s' "$certtext" | grep -qi 'rsaEncryption'; then
+    keydesc="RSA $(printf '%s' "$keyinfo" | grep -oE '[0-9]+ bit' || true)"
+  elif printf '%s' "$certtext" | grep -qi 'Ed25519\|Ed448'; then
+    keydesc="EdDSA"
+  fi
+  local curve
+  curve=$(printf '%s' "$certtext" | grep -m1 'ASN1 OID' | sed -E 's/^ *ASN1 OID: *//' || true)
+  [[ -n "$curve" ]] && keydesc="${keydesc} (${curve})"
+
+  printf '\n%sCertificate%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Subject         : %s\n' "${subject:-unknown}"
+  printf '  Issuer          : %s\n' "${issuer:-unknown}"
+  printf '  Valid from      : %s\n' "${notbefore:-unknown}"
+  printf '  Valid until     : %s\n' "${notafter:-unknown}"
+  printf '  Serial          : %s\n' "${serial:-unknown}"
+  printf '  Key             : %s\n' "${keydesc:-unknown}"
+  printf '  Signature alg   : %s\n' "${sigalg:-unknown}"
+  printf '  SHA-256         : %s\n' "${fp:-unknown}"
+  [[ -n "$san" ]] && printf '  SANs            : %s\n' "$san"
+
+  local days=''
+  days=$(tls_days_until "$notafter" || true)
+  if [[ -n "$days" ]]; then
+    if (( days < 0 )); then
+      printf '  Expires in      : %sEXPIRED %s days ago%s\n' "$C_RED" "$((-days))" "$C_RESET"
+    else
+      printf '  Expires in      : %s days\n' "$days"
+    fi
+  fi
+
+  # --- protocol matrix ----------------------------------------------------
+  printf '\n%sProtocol support%s\n' "$C_BOLD" "$C_RESET"
+  local -a flags=("tls1" "tls1_1" "tls1_2" "tls1_3")
+  local -a names=("TLS 1.0" "TLS 1.1" "TLS 1.2" "TLS 1.3")
+  local i out c
+  for i in 0 1 2 3; do
+    out=$(tls_protocol_test "$host" "$port" "${flags[$i]}")
+    c=$(tls_cipher_of "$out")
+    if [[ -n "$c" ]]; then
+      printf '  %s[+]%s %-9s supported   %s\n' "$C_GREEN" "$C_RESET" "${names[$i]}" "$c"
+    else
+      printf '  %s[-]%s %-9s not supported\n' "$C_RED" "$C_RESET" "${names[$i]}"
+    fi
+  done
+
+  # --- findings -----------------------------------------------------------
+  printf '\n%sFindings%s\n' "$C_BOLD" "$C_RESET"
+  if [[ -n "$days" ]]; then
+    if (( days < 0 )); then
+      printf '  %s[!]%s the certificate expired %s days ago\n' "$C_RED" "$C_RESET" "$((-days))"
+    elif (( days < 15 )); then
+      printf '  %s[!]%s the certificate expires in %s days\n' "$C_YELLOW" "$C_RESET" "$days"
+    elif (( days < 30 )); then
+      printf '  %s[!]%s the certificate expires in %s days\n' "$C_YELLOW" "$C_RESET" "$days"
+    else
+      printf '  %s[+]%s the certificate is valid for another %s days\n' "$C_GREEN" "$C_RESET" "$days"
+    fi
+  fi
+  if printf '%s' "$subject" | grep -q '\*'; then
+    printf '  %s[!]%s wildcard certificate\n' "$C_YELLOW" "$C_RESET"
+  fi
+  if printf '%s' "$sigalg" | grep -qi 'sha1\|md5'; then
+    printf '  %s[!]%s weak signature algorithm: %s\n' "$C_RED" "$C_RESET" "$sigalg"
+  fi
+  if printf '%s' "$keyinfo" | grep -qi '1024'; then
+    printf '  %s[!]%s small key: %s\n' "$C_RED" "$C_RESET" "$keyinfo"
+  fi
+  if [[ -z "$san" ]]; then
+    printf '  %s[!]%s no subject alternative names\n' "$C_YELLOW" "$C_RESET"
+  elif tls_covers_host "$san" "$host"; then
+    printf '  %s[+]%s the certificate covers %s\n' "$C_GREEN" "$C_RESET" "$host"
+  else
+    printf '  %s[!]%s the certificate does not appear to cover %s\n' "$C_YELLOW" "$C_RESET" "$host"
+  fi
+  return 0
+}
+
 # --- Module 2: Info IP and Site -------------------------------------------
 mod_info() {
   local target="${1:-}"
@@ -1720,7 +1981,7 @@ menu() {
       8) pending "subdomains" 14 ;;
       9) pending "archive" 9 ;;
       10) mod_paths ;;
-      11) pending "tls" 10 ;;
+      11) mod_tls ;;
       12) pending "cdn" 11 ;;
       13) pending "intel" 12 ;;
       14) pending "secrets" 17 ;;
@@ -1771,7 +2032,7 @@ main() {
     subdomains) pending "subdomains" 14 ;;
     archive)   pending "archive" 9 ;;
     paths)     mod_paths ${rest[@]+"${rest[@]}"} ;;
-    tls)       pending "tls" 10 ;;
+    tls)       mod_tls ${rest[@]+"${rest[@]}"} ;;
     cdn)       pending "cdn" 11 ;;
     intel)     pending "intel" 12 ;;
     secrets)   pending "secrets" 17 ;;

@@ -154,9 +154,21 @@ run paths 'not a url at all!!'
 expect_match "paths rejects garbage" 'invalid target'
 
 # ---------------------------------------------------------------------------
+section "module: tls"
+
+run tls example.com
+expect_match "tls reports the negotiated protocol" 'Protocol'
+expect_match "tls reports certificate details" 'Certificate|Subject'
+expect_match "tls reports protocol support" 'Protocol support'
+expect_status "tls exits 0" 0
+
+run tls 'not a host!!'
+expect_match "tls rejects garbage" 'invalid host'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in scan hosts subdomains archive tls cdn intel secrets dorks social net; do
+for m in scan hosts subdomains archive cdn intel secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done
