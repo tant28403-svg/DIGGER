@@ -25,10 +25,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
-          # Errors block the build. Warnings are reported for later cleanup
-          # but do not fail a pull request over style.
-          shellcheck --severity=error digger.sh install.sh tests/smoke.sh
-          shellcheck --severity=warning --format=gcc digger.sh install.sh tests/smoke.sh || true
+          # Passes clean at warning level today; keep it that way.
+          shellcheck --severity=warning digger.sh install.sh tests/smoke.sh
 
   test:
     name: smoke tests

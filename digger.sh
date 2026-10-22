@@ -83,11 +83,10 @@ init_colors() {
     C_RED=$'\033[31m'
     C_GREEN=$'\033[32m'
     C_YELLOW=$'\033[33m'
-    C_BLUE=$'\033[34m'
     C_CYAN=$'\033[36m'
   else
     C_RESET=''; C_BOLD=''; C_DIM=''
-    C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''
+    C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
   fi
 }
 
@@ -766,7 +765,7 @@ tls_summary() {
 # URL helpers
 # ---------------------------------------------------------------------------
 url_join() {
-  local base="$1" href="$2" out=''
+  local base="$1" href="$2" py_out=''
   href="${href%%#*}"
   [[ -z "$href" ]] && return 1
   # Values travel through the environment with a one character prefix: MSYS
@@ -774,11 +773,11 @@ url_join() {
   # paths, so "/app.js" would otherwise become "C:/Program Files/Git/app.js"
   # before python sees it.
   if [[ -n "$PY" ]]; then
-    out=$(JOIN_BASE="x${base}" JOIN_HREF="x${href}" "$PY" -c \
+    py_out=$(JOIN_BASE="x${base}" JOIN_HREF="x${href}" "$PY" -c \
       'import os,urllib.parse as u;b=os.environ["JOIN_BASE"][1:];h=os.environ["JOIN_HREF"][1:];print(u.urljoin(b,h))' \
       2>/dev/null || true)
-    if [[ -n "$out" ]]; then
-      printf '%s' "$out"
+    if [[ -n "$py_out" ]]; then
+      printf '%s' "$py_out"
       return 0
     fi
   fi
@@ -826,15 +825,15 @@ url_path() {
 
 # Percent encode a query value for a search engine URL.
 urlencode_q() {
-  local s="$1" out='' quote="'"
+  local s="$1" enc_out='' quote="'"
   # Prefix the value for the same reason as url_join: MSYS rewrites anything
   # that looks like a POSIX path before the python process starts.
   if [[ -n "$PY" ]]; then
-    out=$(URLENC_IN="x${s}" "$PY" -c \
+    enc_out=$(URLENC_IN="x${s}" "$PY" -c \
       'import os,urllib.parse;print(urllib.parse.quote_plus(os.environ["URLENC_IN"][1:]))' \
       2>/dev/null || true)
-    if [[ -n "$out" ]]; then
-      printf '%s' "$out"
+    if [[ -n "$enc_out" ]]; then
+      printf '%s' "$enc_out"
       return 0
     fi
   fi
@@ -2092,10 +2091,9 @@ mod_paths() {
   raw=$(paths_probe_all "$base" "$wordlist" "$conc" "$timeout" "$follow")
 
   # --- baseline (soft 404) detection ---------------------------------------
-  local top base_code='' base_size='' base_hits=0
+  local top base_code='' base_size=''
   top=$(printf '%s\n' "$raw" | awk -F'\t' 'NF>=2{print $1" "$2}' | sort | uniq -c | sort -rn | head -n1 || true)
   if [[ -n "$top" ]]; then
-    base_hits=$(printf '%s' "$top" | awk '{print $1}')
     base_code=$(printf '%s' "$top" | awk '{print $2}')
     base_size=$(printf '%s' "$top" | awk '{print $3}')
   fi
@@ -2558,7 +2556,7 @@ strict-transport-security"
   # --- detection ----------------------------------------------------------
   # A provider is only reported as detected when a header, CNAME or
   # certificate signature matches. An ASN match on its own is weak evidence.
-  local -a cdn_hits=() waf_hits=() cdn_weak=() waf_weak=() evidence=()
+  local -a cdn_hits=() waf_hits=() cdn_weak=() evidence=()
   local row name hdrs cname_p issuer_p asns h
   local -a hs=() sm=() wm=()
 
@@ -3031,7 +3029,7 @@ for row in (data.get('data') or []):
     local body
     body=$(http_get "https://api.hackertarget.com/hostsearch/?q=${domain}" 12 1) || body=''
     if [[ -n "$body" ]] && printf '%s' "$body" | grep -qiE '^[a-z0-9.-]+,[0-9a-f.:]+$'; then
-      printf '%s\n' "$body" | tr 'A-Z' 'a-z' | grep -E '^[a-z0-9._-]+,[0-9a-f.:]+$' || true
+      printf '%s\n' "$body" | tr '[:upper:]' '[:lower:]' | grep -E '^[a-z0-9._-]+,[0-9a-f.:]+$' || true
     fi
   ) &
 
@@ -3854,7 +3852,7 @@ scan_service_name() {
     53) name=domain ;; 80) name=http ;; 110) name=pop3 ;; 111) name=rpcbind ;;
     135) name=msrpc ;; 139) name=netbios-ssn ;; 143) name=imap ;; 161) name=snmp ;;
     389) name=ldap ;; 443) name=https ;; 445) name=microsoft-ds ;; 465) name=smtps ;;
-    512) name=exec ;; 513) name=login ;; 514) name=shell ;; 515) name=printer ;;
+    512) name='exec' ;; 513) name=login ;; 514) name='shell' ;; 515) name=printer ;;
     548) name=afp ;; 587) name=submission ;; 631) name=ipp ;; 636) name=ldaps ;;
     993) name=imaps ;; 995) name=pop3s ;; 1080) name=socks ;;
     1433) name=ms-sql-s ;; 1521) name=oracle ;; 1723) name=pptp ;;
@@ -3930,12 +3928,12 @@ scan_fallback_all() {
 }
 
 mod_scan() {
-  local target='' ports='' top=1000 conc=50 timeout=2 overall=300
+  local target='' ports_spec='' top=1000 conc=50 timeout=2 overall=300
   local version=0
 
   while (( $# > 0 )); do
     case "$1" in
-      --ports)       ports="${2:-}"; shift 2 || shift ;;
+      --ports)       ports_spec="${2:-}"; shift 2 || shift ;;
       --top-ports)   top="${2:-1000}"; shift 2 || shift ;;
       --fast)        top=100; shift ;;
       --version)     version=1; shift ;;
@@ -3994,8 +3992,8 @@ mod_scan() {
   info "Target: ${C_BOLD}${target}${C_RESET} (${ip})"
 
   local scope
-  if [[ -n "$ports" ]]; then
-    scope="ports ${ports}"
+  if [[ -n "$ports_spec" ]]; then
+    scope="ports ${ports_spec}"
   elif [[ "$engine" == 'nmap' ]]; then
     scope="top ${top} TCP ports"
   else
@@ -4024,8 +4022,8 @@ mod_scan() {
 
   if [[ "$engine" == 'nmap' ]]; then
     local -a nmap_args=(-sT -Pn -n -T4 -oG -)
-    if [[ -n "$ports" ]]; then
-      nmap_args+=(-p "$ports")
+    if [[ -n "$ports_spec" ]]; then
+      nmap_args+=(-p "$ports_spec")
     else
       nmap_args+=(--top-ports "$top")
     fi
@@ -4072,10 +4070,10 @@ mod_scan() {
       warn "no 'timeout' command, probes may stall on filtered ports"
     fi
     local -a scan_ports=("${SCAN_FALLBACK_PORTS[@]}")
-    if [[ -n "$ports" ]]; then
-      mapfile -t scan_ports < <(scan_expand_ports "$ports")
+    if [[ -n "$ports_spec" ]]; then
+      mapfile -t scan_ports < <(scan_expand_ports "$ports_spec")
       if (( ${#scan_ports[@]} == 0 )); then
-        err "invalid port list: ${ports}"
+        err "invalid port list: ${ports_spec}"
         return 1
       fi
     fi
@@ -4585,17 +4583,17 @@ info_for_ip() {
 
   # --- quick web service probe --------------------------------------------
   printf '\n%sWeb services%s\n' "$C_BOLD" "$C_RESET"
-  local port scheme code found=0
+  local port scheme code found_svc=0
   for port in 80 443 8080 8443; do
     scheme="http"
     [[ "$port" == "443" || "$port" == "8443" ]] && scheme="https"
     code=$(final_status "${scheme}://${ip}:${port}" 6)
     if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && [[ "$code" != "000" ]]; then
       printf '  %-6s %s -> HTTP %s\n' "$port" "$scheme" "$code"
-      found=1
+      found_svc=1
     fi
   done
-  (( found )) || printf '  %sno web service on common ports%s\n' "$C_DIM" "$C_RESET"
+  (( found_svc )) || printf '  %sno web service on common ports%s\n' "$C_DIM" "$C_RESET"
   return 0
 }
 
@@ -4664,17 +4662,17 @@ info_for_site() {
 
   # --- security headers ---------------------------------------------------
   printf '\n%sSecurity headers%s\n' "$C_BOLD" "$C_RESET"
-  local h present missing=0
-  for h in 'Strict-Transport-Security' 'Content-Security-Policy' 'X-Frame-Options' \
+  local hdr hdr_missing=0
+  for hdr in 'Strict-Transport-Security' 'Content-Security-Policy' 'X-Frame-Options' \
            'X-Content-Type-Options' 'Referrer-Policy' 'Permissions-Policy'; do
-    if header_present "$headers" "$h"; then
-      printf '  %s[+]%s %s\n' "$C_GREEN" "$C_RESET" "$h"
+    if header_present "$headers" "$hdr"; then
+      printf '  %s[+]%s %s\n' "$C_GREEN" "$C_RESET" "$hdr"
     else
-      printf '  %s[-]%s %s %s(missing)%s\n' "$C_RED" "$C_RESET" "$h" "$C_DIM" "$C_RESET"
-      missing=$((missing + 1))
+      printf '  %s[-]%s %s %s(missing)%s\n' "$C_RED" "$C_RESET" "$hdr" "$C_DIM" "$C_RESET"
+      hdr_missing=$((hdr_missing + 1))
     fi
   done
-  (( missing == 0 )) && printf '  %sall common security headers present%s\n' "$C_GREEN" "$C_RESET"
+  (( hdr_missing == 0 )) && printf '  %sall common security headers present%s\n' "$C_GREEN" "$C_RESET"
 
   # --- cookies ------------------------------------------------------------
   local cookies
@@ -4739,7 +4737,7 @@ mod_domain() {
   info "Target: ${C_BOLD}${target}${C_RESET}"
 
   # --- RDAP ---------------------------------------------------------------
-  local rdap ldh registrar status events ns i=0
+  local rdap ldh registrar status i=0
   rdap=$(rdap_get "domain/${target}") || rdap=''
 
   if [[ -n "$rdap" ]]; then
@@ -4925,12 +4923,12 @@ mod_dns() {
 
   local rec out line
   local -a records=(A AAAA MX NS TXT CNAME SOA CAA)
-  local found=0
+  local found_rec=0
 
   for rec in "${records[@]}"; do
     out=$(dns_query "$target" "$rec" 2>/dev/null || true)
     [[ -z "$out" ]] && continue
-    found=1
+    found_rec=1
     printf '\n%s%s records%s\n' "$C_BOLD" "$rec" "$C_RESET"
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
@@ -4938,7 +4936,7 @@ mod_dns() {
     done <<< "$out"
   done
 
-  if (( found == 0 )); then
+  if (( found_rec == 0 )); then
     printf '\n%sno records found%s\n' "$C_DIM" "$C_RESET"
   fi
 
