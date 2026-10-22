@@ -132,9 +132,20 @@ run domain 'not a domain!!'
 expect_match "domain rejects garbage" 'invalid domain'
 
 # ---------------------------------------------------------------------------
+section "module: links"
+
+run links http://example.com --depth 1 --max-pages 5 --delay 0
+expect_match "links reports a crawl summary" 'Pages crawled'
+expect_match "links reports the target" 'example\.com'
+expect_status "links exits 0" 0
+
+run links 'not a url at all!!'
+expect_match "links rejects garbage" 'no URL given|invalid'
+
+# ---------------------------------------------------------------------------
 section "module: stubs"
 
-for m in scan hosts links subdomains archive paths tls cdn intel secrets dorks social net; do
+for m in scan hosts subdomains archive paths tls cdn intel secrets dorks social net; do
   run "$m" some-target
   expect_match "stub '$m' reports not implemented" 'not implemented yet'
 done

@@ -57,6 +57,22 @@ init_colors() {
 # ---------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Compare a possibly fractional value against zero. Bash arithmetic cannot
+# handle decimals, so this avoids (( )) for anything user supplied.
+gt_zero() {
+  local v="${1:-}"
+  [[ -z "$v" ]] && return 1
+  # strip a leading sign and surrounding whitespace
+  v="${v// /}"
+  [[ "$v" == -* ]] && v="${v#-}"
+  # zero in any shape: 0, 0.0, 00.000, .0
+  if [[ "$v" =~ ^0*(\.[0]*)?$ ]] && [[ -n "$v" ]]; then
+    return 1
+  fi
+  [[ "$v" =~ ^[0-9]*\.?[0-9]+$ ]] || return 0
+  return 0
+}
+
 # Detect a python that actually runs. Some systems ship a python3 shim that
 # exists on PATH but fails when called (Windows Store alias, broken symlink),
 # so existence alone is not good enough.
@@ -634,9 +650,249 @@ tls_summary() {
   return 0
 }
 
-# ===========================================================================
-# MODULES
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------------
+url_join() {
+  local base="$1" href="$2" out=''
+  href="${href%%#*}"
+  [[ -z "$href" ]] && return 1
+  if [[ -n "$PY" ]]; then
+    out=$("$PY" -c 'import sys,urllib.parse;print(urllib.parse.urljoin(sys.argv[1],sys.argv[2]))' \
+      "$base" "$href" 2>/dev/null || true)
+    if [[ -n "$out" ]]; then
+      printf '%s' "$out"
+      return 0
+    fi
+  fi
+
+  # bash fallback
+  case "$href" in
+    http://*|https://*) printf '%s' "$href"; return 0 ;;
+    //*) printf '%s:%s' "${base%%://*}" "$href"; return 0 ;;
+  esac
+  local scheme="${base%%://*}"
+  local rest="${base#*://}"
+  local host="${rest%%/*}"
+  local path="${rest#*/}"
+  [[ "$path" == "$rest" ]] && path="/"
+  case "$href" in
+    /*) path="$href" ;;
+    *)  path="${path%/*}/$href" ;;
+  esac
+  local -a parts=() out_parts=()
+  local IFS='/'
+  read -r -a parts <<< "$path"
+  unset IFS
+  local seg
+  for seg in "${parts[@]}"; do
+    case "$seg" in
+      ''|'.') continue ;;
+      '..') if (( ${#out_parts[@]} > 0 )); then
+              out_parts=("${out_parts[@]:0:${#out_parts[@]}-1}")
+            fi ;;
+      *) out_parts+=("$seg") ;;
+    esac
+  done
+  local joined
+  joined=$(IFS='/'; printf '%s' "${out_parts[*]}")
+  printf '%s://%s/%s' "$scheme" "$host" "$joined"
+}
+
+url_host() {
+  printf '%s' "$1" | sed -E 's#^[a-z]+://([^/]+).*#\1#'
+}
+
+url_path() {
+  printf '%s' "$1" | sed -E 's#^[a-z]+://[^/]+##'
+}
+
+# Pull every candidate link out of an HTML document.
+extract_links() {
+  local body="$1"
+  {
+    printf '%s' "$body" \
+      | grep -oiE '(href|src|action|poster|data-src|data-url|data-href)\s*=\s*"[^"]*"' \
+      | sed -E 's/^[A-Za-z-]+\s*=\s*"//; s/"$//' || true
+    printf '%s' "$body" \
+      | grep -oiE "(href|src|action|poster|data-src|data-url|data-href)\s*=\s*'[^']*'" \
+      | sed -E "s/^[A-Za-z-]+\s*=\s*'//; s/'\$//" || true
+    printf '%s' "$body" \
+      | grep -oiE '(href|src|action|poster)\s*=\s*[A-Za-z0-9_./?=&%:+~-]+' \
+      | sed -E 's/^[A-Za-z-]+\s*=\s*//' || true
+    printf '%s' "$body" \
+      | grep -oiE '(srcset|data-srcset)\s*=\s*"[^"]*"' \
+      | sed -E 's/^[A-Za-z-]+\s*=\s*"//; s/"$//' \
+      | sed -E 's/,[[:space:]]+/\n/g' | awk '{print $1}' || true
+    printf '%s' "$body" \
+      | grep -oiE 'url\([^)]*\)' \
+      | sed -E 's/^url\(//; s/\)$//; s/^["'"'"']//; s/["'"'"']$//' || true
+  } | sed 's/[[:space:]]*$//' | awk 'length($0) > 0'
+}
+
+# --- Module 7: Extract Links ----------------------------------------------
+mod_links() {
+  local target="" depth=5 maxpages=100 delay="0.3" external=0 ignore_robots=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --depth)            depth="${2:-5}"; shift 2 || shift ;;
+      --max-pages)        maxpages="${2:-100}"; shift 2 || shift ;;
+      --delay)            delay="${2:-0.3}"; shift 2 || shift ;;
+      --include-external) external=1; shift ;;
+      --ignore-robots)    ignore_robots=1; shift ;;
+      -h|--help)
+        printf 'usage: digger.sh links <url> [--depth N] [--max-pages N] [--delay S] [--include-external] [--ignore-robots]\n'
+        return 0 ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; fi
+        shift ;;
+    esac
+  done
+
+  heading "EXTRACT LINKS"
+  hr 60
+
+  if [[ -z "$target" ]]; then
+    target=$(prompt "Start URL")
+  fi
+  target="${target// /}"
+  if [[ -z "$target" ]]; then
+    err "no URL given"
+    return 1
+  fi
+  [[ "$target" != http://* && "$target" != https://* ]] && target="https://${target}"
+  target="${target%/}"
+
+  local hostpart="${target#*://}"
+  hostpart="${hostpart%%/*}"
+  hostpart="${hostpart%%:*}"
+  if ! is_hostname "$hostpart" && ! is_ip "$hostpart"; then
+    err "invalid URL: ${target}"
+    return 1
+  fi
+
+  info "Target: ${C_BOLD}${target}${C_RESET}"
+  printf '  Limits      : depth %s, max pages %s, delay %ss\n' "$depth" "$maxpages" "$delay"
+
+  # --- robots.txt ---------------------------------------------------------
+  local -a disallow=()
+  if (( ! ignore_robots )) && have curl; then
+    local robots
+    robots=$(http_get "${target}/robots.txt" 10 0) || robots=''
+    if [[ -n "$robots" ]]; then
+      local line path agent in_star=0
+      while IFS= read -r line; do
+        line="${line%%#*}"
+        line=$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        local lower="${line,,}"
+        case "$lower" in
+          user-agent:*)
+            in_star=0
+            agent=$(printf '%s' "${line#*:}" | sed 's/^[[:space:]]*//')
+            [[ "$agent" == "*" ]] && in_star=1 ;;
+          disallow:*)
+            if (( in_star == 1 )); then
+              path=$(printf '%s' "${line#*:}" | sed 's/^[[:space:]]*//')
+              [[ -n "$path" ]] && disallow+=("$path")
+            fi ;;
+        esac
+      done <<< "$robots"
+    fi
+  fi
+
+  is_disallowed() {
+    local path="$1" d
+    for d in ${disallow[@]+"${disallow[@]}"}; do
+      [[ -z "$d" ]] && continue
+      [[ "$path" == "$d"* ]] && return 0
+    done
+    return 1
+  }
+
+  local base_host
+  base_host=$(url_host "$target")
+
+  local -A seen=()
+  local -a queue=() pages=() internal=() external_links=()
+  queue+=("0|${target}")
+
+  local pages_n=0 links_n=0
+  while (( ${#queue[@]} > 0 )); do
+    local entry="${queue[0]}"
+    queue=("${queue[@]:1}")
+    local d="${entry%%|*}" u="${entry#*|}"
+    (( d > depth )) && continue
+    [[ -n "${seen[$u]:-}" ]] && continue
+    (( pages_n >= maxpages )) && break
+
+    local path
+    path=$(url_path "$u")
+    if (( ${#disallow[@]} > 0 )) && is_disallowed "$path"; then
+      continue
+    fi
+
+    seen["$u"]=1
+    local body
+    body=$(page_body "$u" 400000)
+    [[ -z "$body" ]] && continue
+
+    pages_n=$((pages_n + 1))
+    pages+=("$u")
+
+    local link abs ahost
+    while IFS= read -r link; do
+      [[ -z "$link" ]] && continue
+      case "${link,,}" in
+        javascript:*|mailto:*|tel:*|data:*|about:*|ftp:*|blob:*|file:*) continue ;;
+      esac
+      abs=$(url_join "$u" "$link" || true)
+      [[ -z "$abs" ]] && continue
+      case "$abs" in
+        http://*|https://*) ;;
+        *) continue ;;
+      esac
+      links_n=$((links_n + 1))
+      ahost=$(url_host "$abs")
+      if [[ "$ahost" == "$base_host" ]]; then
+        internal+=("$abs")
+        if (( d < depth )) && [[ -z "${seen[$abs]:-}" ]]; then
+          queue+=("$((d + 1))|${abs}")
+        fi
+      else
+        external_links+=("$abs")
+        if (( external )) && (( d < depth )) && [[ -z "${seen[$abs]:-}" ]]; then
+          queue+=("$((d + 1))|${abs}")
+        fi
+      fi
+    done < <(extract_links "$body")
+
+    if gt_zero "$delay"; then sleep "$delay"; fi
+  done
+
+  printf '\n%sResult%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Pages crawled : %s\n' "$pages_n"
+  printf '  Links seen    : %s\n' "$links_n"
+
+  if (( ${#pages[@]} > 0 )); then
+    printf '\n%sPages%s\n' "$C_BOLD" "$C_RESET"
+    printf '%s\n' "${pages[@]}" | sed 's/^/  /'
+  fi
+
+  local uniq_int uniq_ext
+  uniq_int=$(printf '%s\n' ${internal[@]+"${internal[@]}"} | sed '/^$/d' | sort -u)
+  uniq_ext=$(printf '%s\n' ${external_links[@]+"${external_links[@]}"} | sed '/^$/d' | sort -u)
+
+  if [[ -n "$uniq_int" ]]; then
+    printf '\n%sInternal links%s (%s)\n' "$C_BOLD" "$C_RESET" "$(printf '%s\n' "$uniq_int" | grep -c . || true)"
+    printf '%s\n' "$uniq_int" | sed 's/^/  /'
+  fi
+  if [[ -n "$uniq_ext" ]]; then
+    printf '\n%sExternal links%s (%s)\n' "$C_BOLD" "$C_RESET" "$(printf '%s\n' "$uniq_ext" | grep -c . || true)"
+    printf '%s\n' "$uniq_ext" | sed 's/^/  /'
+  fi
+  return 0
+}
 
 # --- Module 2: Info IP and Site -------------------------------------------
 mod_info() {
@@ -1228,7 +1484,7 @@ menu() {
       6) mod_domain ;;
       4) pending "scan" 16 ;;
       5) pending "hosts" 15 ;;
-      7) pending "links" 7 ;;
+      7) mod_links ;;
       8) pending "subdomains" 14 ;;
       9) pending "archive" 9 ;;
       10) pending "paths" 9 ;;
@@ -1278,7 +1534,7 @@ main() {
     domain)    mod_domain "${rest[0]:-}" ;;
     scan)      pending "scan" 16 ;;
     hosts)     pending "hosts" 15 ;;
-    links)     pending "links" 7 ;;
+    links)     mod_links ${rest[@]+"${rest[@]}"} ;;
     subdomains) pending "subdomains" 14 ;;
     archive)   pending "archive" 9 ;;
     paths)     pending "paths" 9 ;;
