@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# DIGGER v1.0 - passive first, loud when needed
+# DIGGER v2.0 - passive first, loud when needed
 #
 # Reconnaissance toolkit for Linux. Single file, no build step, keyless
 # data sources only.
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 readonly TOOL_NAME="DIGGER"
-readonly VERSION="1.0.0"
+readonly VERSION="2.0.0"
 readonly USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 DIGGER/${VERSION}"
 
 # ---------------------------------------------------------------------------
@@ -22,8 +22,21 @@ SHOW_BANNER=1
 ASSUME_YES="${ASSUME_YES:-}"
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-15}"
 HTTP_RETRIES="${HTTP_RETRIES:-1}"
+HTTP_RETRY_DELAY="${HTTP_RETRY_DELAY:-1}"
+HTTP_RETRY_BACKOFF="${HTTP_RETRY_BACKOFF:-2}"
+DIGGER_CONCURRENCY="${DIGGER_CONCURRENCY:-}"
+DIGGER_STEALTH="${DIGGER_STEALTH:-}"
+DIGGER_I_HAVE_PERMISSION="${DIGGER_I_HAVE_PERMISSION:-}"
+DIGGER_PROXY="${DIGGER_PROXY:-}"
+DIGGER_PROXY_LIST="${DIGGER_PROXY_LIST:-}"
+DIGGER_UA_ROTATE="${DIGGER_UA_ROTATE:-}"
+DIGGER_JITTER="${DIGGER_JITTER:-}"
+DIGGER_DELAY="${DIGGER_DELAY:-}"
+DIGGER_CACHE_DIR="${DIGGER_CACHE_DIR:-}"
+DIGGER_CACHE_TTL="${DIGGER_CACHE_TTL:-300}"
+DIGGER_AUDIT_LOG="${DIGGER_AUDIT_LOG:-}"
+DIGGER_HTTP2="${DIGGER_HTTP2:-}"
 PY=""
-
 DIGGER_HOME=""
 
 # Locate the directory holding digger.sh so shipped wordlists are found no
@@ -98,6 +111,145 @@ init_colors() {
 # Output helpers
 # ---------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Performance and stealth helpers
+# ---------------------------------------------------------------------------
+STEALTH_ENABLED=0
+PERMISSION_GRANTED=0
+DNS_CACHE_ENABLED=1
+declare -A DNS_CACHE=()
+declare -A PASSIVE_CACHE=()
+STEALTH_UA_POOL=(
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+)
+
+stealth_active() { (( STEALTH_ENABLED == 1 )); }
+permission_ok() { (( PERMISSION_GRANTED == 1 )) || [[ -n "$DIGGER_I_HAVE_PERMISSION" ]]; }
+
+audit_log() {
+  [[ -n "$DIGGER_AUDIT_LOG" ]] || return 0
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$DIGGER_AUDIT_LOG" 2>/dev/null || true
+}
+
+jitter_sleep() {
+  local base="${1:-0}" min max delay
+  if [[ -n "$DIGGER_JITTER" && "$DIGGER_JITTER" == *-* ]]; then
+    min="${DIGGER_JITTER%%-*}"
+    max="${DIGGER_JITTER##*-}"
+  else
+    min="${DIGGER_JITTER:-0}"
+    max="$min"
+  fi
+  if [[ -n "$DIGGER_DELAY" ]]; then base="$DIGGER_DELAY"; fi
+  if gt_zero "$base" || gt_zero "$min"; then
+    if [[ -n "$PY" ]]; then
+      delay="$("$PY" -c 'import random,sys; mn=float(sys.argv[1]); mx=float(sys.argv[2]); base=float(sys.argv[3]); print(random.uniform(base+mn, base+mx))' "$min" "$max" "$base" 2>/dev/null || true)"
+    else
+      delay="$base"
+    fi
+    [[ -z "$delay" ]] && delay="$base"
+    if gt_zero "$delay"; then jitter_sleep "$delay" 0; fi
+  fi
+}
+
+current_user_agent() {
+  if [[ -n "${USER_AGENT_OVERRIDE:-}" ]]; then
+    printf '%s' "$USER_AGENT_OVERRIDE"
+    return 0
+  fi
+  if stealth_active && [[ "$DIGGER_UA_ROTATE" == "1" || -n "$DIGGER_UA_ROTATE" ]]; then
+    if [[ -n "$PY" ]]; then
+      printf '%s' "${STEALTH_UA_POOL[$("$PY" -c 'import random,sys;print(random.randrange(int(sys.argv[1])))' "${#STEALTH_UA_POOL[@]}" 2>/dev/null || echo 0)]}"
+      return 0
+    fi
+  fi
+  printf '%s' "$USER_AGENT"
+}
+
+current_proxy() {
+  if [[ -n "$DIGGER_PROXY" ]]; then
+    printf '%s' "$DIGGER_PROXY"
+    return 0
+  fi
+  if [[ -n "$DIGGER_PROXY_LIST" && -f "$DIGGER_PROXY_LIST" ]]; then
+    if [[ -n "$PY" ]]; then
+      "$PY" -c 'import random,sys;lines=[x.strip() for x in open(sys.argv[1]) if x.strip() and not x.strip().startswith("#")];print(random.choice(lines) if lines else "")' "$DIGGER_PROXY_LIST" 2>/dev/null
+    else
+      sed -n '1p' "$DIGGER_PROXY_LIST"
+    fi
+    return 0
+  fi
+  printf ''
+}
+
+dns_cache_key() { printf '%s|%s' "$1" "$2"; }
+
+dns_cache_get() {
+  (( DNS_CACHE_ENABLED )) || return 1
+  local key
+  key="$(dns_cache_key "$1" "$2")"
+  if [[ -n "${DNS_CACHE[$key]:-}" ]]; then
+    printf '%s' "${DNS_CACHE[$key]}"
+    return 0
+  fi
+  return 1
+}
+
+dns_cache_set() {
+  local key
+  key="$(dns_cache_key "$1" "$2")"
+  DNS_CACHE["$key"]="$3"
+}
+
+run_parallel() {
+  local max="${1:-4}"; shift
+  local -a pids=()
+  local cmd
+  for cmd in "$@"; do
+    bash -c "$cmd" &
+    pids+=($!)
+    if (( ${#pids[@]} >= max )); then
+      wait "${pids[0]}" 2>/dev/null || true
+      pids=("${pids[@]:1}")
+    fi
+  done
+  wait 2>/dev/null || true
+}
+
+global_concurrency() {
+  if [[ -n "$DIGGER_CONCURRENCY" ]]; then
+    printf '%s' "$DIGGER_CONCURRENCY"
+  elif stealth_active; then
+    printf '4'
+  else
+    printf '%s' "${1:-10}"
+  fi
+}
+
+passive_cache_get() {
+  local key="$1"
+  [[ -n "${PASSIVE_CACHE[$key]:-}" ]] && { printf '%s' "${PASSIVE_CACHE[$key]}"; return 0; }
+  return 1
+}
+
+passive_cache_set() {
+  local key="$1" val="$2"
+  PASSIVE_CACHE["$key"]="$val"
+}
+
+http_policy_args() {
+  local -a args=()
+  local proxy ua
+  proxy="$(current_proxy)"
+  ua="$(current_user_agent)"
+  [[ -n "$proxy" ]] && args+=(-x "$proxy")
+  args+=(-A "$ua")
+  if [[ "$DIGGER_HTTP2" == "1" ]]; then args+=(--http2); fi
+  printf '%s\n' "${args[@]}"
+}
 
 # Compare a possibly fractional value against zero. Bash arithmetic cannot
 # handle decimals, so this avoids (( )) for anything user supplied.
@@ -183,7 +335,7 @@ show_banner() {
 | | | | | |  _| |  _|  _| | |_) |
 | |_| | | |_| | |_| | |___|  _ <
 |____/___\____|\____|_____|_| \_\
-           DIGGER v1.0
+           DIGGER v2.0
 passive first - loud when needed
 EOF
 }
@@ -250,6 +402,21 @@ parse_args() {
       --no-banner)  SHOW_BANNER=0 ;;
       --timeout)    HTTP_TIMEOUT="${2:-15}"; shift ;;
       --yes|-y)     ASSUME_YES=1 ;;
+      --stealth)    DIGGER_STEALTH=1 ;;
+      --no-stealth) DIGGER_STEALTH=0 ;;
+      --i-have-permission) DIGGER_I_HAVE_PERMISSION=1 ;;
+      --proxy)      DIGGER_PROXY="${2:-}"; shift ;;
+      --proxy-list) DIGGER_PROXY_LIST="${2:-}"; shift ;;
+      --ua-rotate)  DIGGER_UA_ROTATE=1 ;;
+      --user-agent) USER_AGENT_OVERRIDE="${2:-}"; shift ;;
+      --jitter)     DIGGER_JITTER="${2:-}"; shift ;;
+      --delay)      DIGGER_DELAY="${2:-}"; shift ;;
+      --concurrency|--threads) DIGGER_CONCURRENCY="${2:-}"; shift ;;
+      --cache-dir)  DIGGER_CACHE_DIR="${2:-}"; shift ;;
+      --cache-ttl)  DIGGER_CACHE_TTL="${2:-300}"; shift ;;
+      --no-cache)   DNS_CACHE_ENABLED=0 ;;
+      --http2)      DIGGER_HTTP2=1 ;;
+      --audit-log)  DIGGER_AUDIT_LOG="${2:-}"; shift ;;
       *)            break ;;
     esac
     shift
@@ -329,34 +496,47 @@ is_valid_target() {
 # ---------------------------------------------------------------------------
 http_get() {
   local url="$1" timeout="${2:-$HTTP_TIMEOUT}" retries="${3:-$HTTP_RETRIES}"
-  local attempt=0 out rc
+  local attempt=0 out rc delay proxy ua
+  proxy="$(current_proxy)"
+  ua="$(current_user_agent)"
   while (( attempt <= retries )); do
     attempt=$(( attempt + 1 ))
     set +e
-    out=$(curl -sS -L --compressed \
+    out=$(curl -sS -L --compressed --keepalive-time 30 \
       --max-time "$timeout" --connect-timeout "$timeout" \
-      -H "User-Agent: $USER_AGENT" \
+      ${proxy:+-x "$proxy"} \
+      -A "$ua" \
       -H 'Accept: */*' \
+      ${DIGGER_HTTP2:+--http2} \
       -- "$url" 2>/dev/null </dev/null | tr -d '\000')
     rc=$?
     set -e
     if (( rc == 0 )) && [[ -n "$out" ]]; then
+      jitter_sleep 0 0
       printf '%s' "$out"
       return 0
     fi
-    (( attempt <= retries )) && sleep 1
+    if (( attempt <= retries )); then
+      delay="$HTTP_RETRY_DELAY"
+      HTTP_RETRY_DELAY=$(awk -v n="$HTTP_RETRY_DELAY" -v b="$HTTP_RETRY_BACKOFF" 'BEGIN{print n*b}')
+      sleep "$delay"
+    fi
   done
   return 1
 }
 
 http_head() {
   local url="$1" timeout="${2:-$HTTP_TIMEOUT}" retries="${3:-$HTTP_RETRIES}"
-  local attempt=0 out rc
+  local attempt=0 out rc delay proxy ua
+  proxy="$(current_proxy)"
+  ua="$(current_user_agent)"
   while (( attempt <= retries )); do
     attempt=$(( attempt + 1 ))
     set +e
-    out=$(curl -sS -L -I --max-time "$timeout" --connect-timeout "$timeout" \
-      -H "User-Agent: $USER_AGENT" \
+    out=$(curl -sS -L -I --keepalive-time 30 --max-time "$timeout" --connect-timeout "$timeout" \
+      ${proxy:+-x "$proxy"} \
+      -A "$ua" \
+      ${DIGGER_HTTP2:+--http2} \
       -- "$url" 2>/dev/null </dev/null)
     rc=$?
     set -e
@@ -364,16 +544,25 @@ http_head() {
       printf '%s' "$out"
       return 0
     fi
-    (( attempt <= retries )) && sleep 1
+    if (( attempt <= retries )); then
+      delay="$HTTP_RETRY_DELAY"
+      sleep "$delay"
+    fi
   done
   return 1
 }
 
 http_code() {
   local url="$1" timeout="${2:-$HTTP_TIMEOUT}"
+  local proxy ua
+  proxy="$(current_proxy)"
+  ua="$(current_user_agent)"
   set +e
-  curl -sS -o /dev/null -L --max-time "$timeout" --connect-timeout "$timeout" \
-    -H "User-Agent: $USER_AGENT" -w '%{http_code}' -- "$url" 2>/dev/null
+  curl -sS -o /dev/null -L --keepalive-time 30 --max-time "$timeout" --connect-timeout "$timeout" \
+    ${proxy:+-x "$proxy"} \
+    -A "$ua" \
+    ${DIGGER_HTTP2:+--http2} \
+    -w '%{http_code}' -- "$url" 2>/dev/null
   set -e
 }
 
@@ -549,18 +738,29 @@ check_deps() {
 # are frequently self-signed or mismatched. We never act on the content.
 final_status() {
   local url="$1" timeout="${2:-$HTTP_TIMEOUT}"
+  local proxy ua
+  proxy="$(current_proxy)"
+  ua="$(current_user_agent)"
   set +e
-  curl -sS -o /dev/null -L -k --max-time "$timeout" --connect-timeout "$timeout" \
-    -H "User-Agent: $USER_AGENT" -w '%{http_code}' -- "$url" 2>/dev/null
+  curl -sS -o /dev/null -L -k --keepalive-time 30 --max-time "$timeout" --connect-timeout "$timeout" \
+    ${proxy:+-x "$proxy"} \
+    -A "$ua" \
+    ${DIGGER_HTTP2:+--http2} \
+    -w '%{http_code}' -- "$url" 2>/dev/null
   set -e
 }
 
-# Headers of the final response in a redirect chain.
 final_headers() {
   local url="$1" timeout="${2:-$HTTP_TIMEOUT}"
+  local proxy ua
+  proxy="$(current_proxy)"
+  ua="$(current_user_agent)"
   set +e
-  curl -sS -o /dev/null -D - -L -k --max-time "$timeout" --connect-timeout "$timeout" \
-    -H "User-Agent: $USER_AGENT" -- "$url" 2>/dev/null \
+  curl -sS -o /dev/null -D - -L -k --keepalive-time 30 --max-time "$timeout" --connect-timeout "$timeout" \
+    ${proxy:+-x "$proxy"} \
+    -A "$ua" \
+    ${DIGGER_HTTP2:+--http2} \
+    -- "$url" 2>/dev/null \
     | awk 'BEGIN{RS="\n\n"} {buf=$0} END{printf "%s", buf}'
   set -e
 }
@@ -597,10 +797,14 @@ header_sig_present() {
 
 page_body() {
   local url="$1" limit="${2:-500000}" body=''
-  # Binary targets (favicons, fonts, images) can contain NUL bytes. Bash
-  # removes them from command substitution and prints a warning, so drop
-  # the NULs before capture.
-  body=$(curl -sS -L -k --max-time 20 -H "User-Agent: $USER_AGENT" -- "$url" 2>/dev/null \
+  local proxy ua
+  proxy="$(current_proxy)"
+  ua="$(current_user_agent)"
+  body=$(curl -sS -L -k --keepalive-time 30 --max-time 20 \
+    ${proxy:+-x "$proxy"} \
+    -A "$ua" \
+    ${DIGGER_HTTP2:+--http2} \
+    -- "$url" 2>/dev/null \
     | tr -d '\000' \
     | head -c "$limit" || true)
   printf '%s' "$body"
@@ -667,6 +871,10 @@ rdap_role_field() {
 # to the DNS-over-HTTPS resolver so the tool still works on a bare box.
 resolve_host() {
   local host="$1" ip=''
+  if dns_cache_get "$host" A >/dev/null 2>&1; then
+    dns_cache_get "$host" A
+    return 0
+  fi
   if have dig; then
     ip=$(dig +short +time=3 +tries=1 A "$host" 2>/dev/null | tail -n1 || true)
   fi
@@ -681,13 +889,19 @@ resolve_host() {
     fi
   fi
   [[ -n "$ip" ]] || return 1
+  dns_cache_set "$host" A "$ip"
   printf '%s' "$ip"
 }
 
 # Query a DNS record type. dig when available, DNS over HTTPS otherwise.
 # Returns one record per line.
 dns_query() {
-  local name="$1" type="$2" out=''
+  local name="$1" type="$2" out='' cached
+  cached="$(dns_cache_get "$name" "$type" 2>/dev/null || true)"
+  if [[ -n "$cached" ]]; then
+    printf '%s' "$cached"
+    return 0
+  fi
   if have dig; then
     out=$(dig +short +time=4 +tries=1 "$type" "$name" 2>/dev/null || true)
   fi
@@ -700,6 +914,7 @@ dns_query() {
     fi
   fi
   [[ -z "$out" ]] && return 1
+  dns_cache_set "$name" "$type" "$out"
   printf '%s' "$out"
 }
 
@@ -1051,7 +1266,7 @@ mod_links() {
       fi
     done < <(extract_links "$body")
 
-    if gt_zero "$delay"; then sleep "$delay"; fi
+    if gt_zero "$delay"; then jitter_sleep "$delay" 0; fi
   done
 
   printf '\n%sResult%s\n' "$C_BOLD" "$C_RESET"
@@ -1448,7 +1663,7 @@ EOF
 social_check_one() {
   local label="$1" url="$2" marker="$3" timeout="$4"
   local code body result
-  code=$(curl -sS -L -m "$timeout" -A "$USER_AGENT" -o /dev/null \
+  code=$(curl -sS -L -m "$timeout" ${DIGGER_PROXY:+-x "$DIGGER_PROXY"} -A "$(current_user_agent)" -o /dev/null \
     -w '%{http_code}' -- "$url" 2>/dev/null || true)
   [[ "$code" =~ ^[0-9]{3}$ ]] || code='000'
   case "$code" in
@@ -1459,7 +1674,7 @@ social_check_one() {
   esac
   # Some sites return 200 for every name and explain the miss in the page.
   if [[ "$result" == 'found' && -n "$marker" ]]; then
-    body=$(curl -sS -L -m "$timeout" -A "$USER_AGENT" -- "$url" 2>/dev/null \
+    body=$(curl -sS -L -m "$timeout" ${DIGGER_PROXY:+-x "$DIGGER_PROXY"} -A "$(current_user_agent)" -- "$url" 2>/dev/null \
       | tr -d '\000' \
       | head -c 200000 || true)
     if printf '%s' "$body" | grep -qiE -- "$marker"; then
@@ -1487,7 +1702,7 @@ social_check_all() {
 }
 
 mod_social() {
-  local target='' handle='' timeout=12 conc=8 verbose=0
+  local target='' handle='' timeout=12 conc="$(global_concurrency 8)" verbose=0
 
   while (( $# > 0 )); do
     case "$1" in
@@ -2047,7 +2262,7 @@ paths_probe_all() {
 }
 
 mod_paths() {
-  local target="" wordlist='' conc=10 timeout=10 follow=1
+  local target="" wordlist='' conc="$(global_concurrency 10)" timeout=10 follow=1
 
   while (( $# > 0 )); do
     case "$1" in
@@ -3217,7 +3432,7 @@ sub_check_wildcard() {
 }
 
 mod_subdomains() {
-  local target='' wordlist='' use_ct=1 use_pdns=1 use_wl=1 use_pattern=1 threads=10 limit=0 resolve=1
+  local target='' wordlist='' use_ct=1 use_pdns=1 use_wl=1 use_pattern=1 threads="$(global_concurrency 10)" limit=0 resolve=1
 
   while (( $# > 0 )); do
     case "$1" in
@@ -3582,12 +3797,16 @@ host_probe_vhost() {
   local vhost="$1" ip="$2" timeout="$3"
   local lit out code='' size='' scheme='https'
   lit=$(host_addr_literal "$ip")
-  out=$(curl -sS -k --max-time "$timeout" -o /dev/null \
+  out=$(curl -sS -k --keepalive-time 30 --max-time "$timeout" -o /dev/null \
+    ${DIGGER_PROXY:+-x "$DIGGER_PROXY"} \
+    -A "$(current_user_agent)" \
     -w '%{http_code} %{size_download}' \
     --resolve "${vhost}:443:${lit}" "https://${vhost}/" 2>/dev/null || true)
   code="${out%% *}"; size="${out##* }"
   if [[ -z "$out" || "$code" == '000' ]]; then
-    out=$(curl -sS --max-time "$timeout" -o /dev/null \
+    out=$(curl -sS --keepalive-time 30 --max-time "$timeout" -o /dev/null \
+      ${DIGGER_PROXY:+-x "$DIGGER_PROXY"} \
+      -A "$(current_user_agent)" \
       -w '%{http_code} %{size_download}' \
       -H "Host: ${vhost}" "http://${lit}/" 2>/dev/null || true)
     code="${out%% *}"; size="${out##* }"; scheme='http'
@@ -3615,7 +3834,7 @@ host_probe_all() {
 }
 
 mod_hosts() {
-  local target='' wordlist='' conc=10 timeout=8 probe=0 limit=100
+  local target='' wordlist='' conc="$(global_concurrency 10)" timeout=8 probe=0 limit=100
 
   while (( $# > 0 )); do
     case "$1" in
@@ -3971,7 +4190,7 @@ scan_fallback_all() {
 }
 
 mod_scan() {
-  local target='' ports_spec='' top=1000 conc=50 timeout=2 overall=300
+  local target='' ports_spec='' top=1000 conc="$(global_concurrency 50)" timeout=2 overall=300
   local version=0
 
   while (( $# > 0 )); do
@@ -4385,7 +4604,7 @@ mod_secrets() {
       fi
     done < <(extract_links "$body")
 
-    if gt_zero "$delay"; then sleep "$delay"; fi
+    if gt_zero "$delay"; then jitter_sleep "$delay" 0; fi
   done
 
   if (( pages_n == 0 )); then
@@ -4863,7 +5082,8 @@ mod_myip() {
   hr 60
 
   local ip='' url
-  for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+  local -a urls=(https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com)
+  for url in "${urls[@]}"; do
     ip=$(http_get "$url" 10 1) || ip=''
     if [[ -n "$ip" ]]; then
       break
@@ -5132,6 +5352,12 @@ main() {
   resolve_home || true
   PY="$(detect_python || true)"
   parse_args "$@"
+  [[ "$DIGGER_STEALTH" == "1" ]] && STEALTH_ENABLED=1
+  [[ -n "$DIGGER_I_HAVE_PERMISSION" ]] && PERMISSION_GRANTED=1
+  if stealth_active && ! permission_ok; then
+    err "stealth/evasion requires --i-have-permission (or DIGGER_I_HAVE_PERMISSION=1)"
+    STEALTH_ENABLED=0
+  fi
 
   check_deps || true
 

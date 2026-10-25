@@ -6,7 +6,7 @@
 | | | | | |  _| |  _|  _| | |_) |
 | |_| | | |_| | |_| | |___|  _ <
 |____/___\____|\____|_____|_| \_\
-           DIGGER v1.0
+           DIGGER v2.0
 passive first - loud when needed
 ```
 
@@ -33,13 +33,14 @@ understand the complete implementation. Please use it responsibly, and only
 against systems you own or have explicit written permission to test.
 
 **Capability Notice:** This is a passive-first reconnaissance toolkit for
-authorised assessment and learning. It is not an exploitation framework, and
-it has no evasion features: no address spoofing, no proxy rotation, and no
-attempt to hide the requests it makes. It collects public information from
-third-party services and, when you ask it to, sends ordinary DNS, HTTP, TLS,
-TCP or traceroute traffic to the target you choose. Third-party data can be
-incomplete, stale or rate-limited, and a finding is a lead to verify — not
-proof of a vulnerability.
+authorised assessment and learning. It is not an exploitation framework.
+Optional stealth/evasion features are now available behind an explicit
+`--i-have-permission` gate: proxy rotation, User-Agent rotation, jitter,
+request ordering randomisation and adaptive backoff. Address spoofing is not
+supported. All features send ordinary DNS, HTTP, TLS, TCP or traceroute
+traffic to the target you choose. Third-party data can be incomplete, stale
+or rate-limited, and a finding is a lead to verify — not proof of a
+vulnerability.
 
 ⚠️ **FOR EDUCATIONAL USE AND AUTHORISED SECURITY TESTING ONLY**
 Please use this tool only against systems you own or have explicit written
@@ -329,16 +330,106 @@ read before you interpret the output.
 | `--no-banner` | off | suppress the banner |
 | `--timeout <sec>` | 15 | per-request HTTP timeout |
 | `-y`, `--yes` | off | assume yes for confirmation prompts |
+| `--stealth` | off | enable stealth/evasion mode |
+| `--i-have-permission` | off | required for stealth/evasion |
+| `--concurrency <n>` | module default | global concurrency ceiling |
+| `--proxy <url>` | unset | proxy for all requests |
+| `--jitter <min-max>` | unset | random delay range |
+| `--cache-dir <dir>` | unset | on-disk response cache |
+| `--http2` | off | prefer HTTP/2 |
 
 | Variable | Default | Notes |
 |---|---|---|
 | `NO_COLOR` | unset | disable colours (the standard convention) |
 | `ASSUME_YES` | unset | same as `-y` |
 | `HTTP_TIMEOUT` | 15 | per-request HTTP timeout in seconds |
-| `HTTP_RETRIES` | 1 | retries after a failed HTTP request, so two attempts in total |
+| `HTTP_RETRIES` | 1 | retries after a failed HTTP request (two attempts total) |
+| `HTTP_RETRY_DELAY` | 1 | initial retry delay in seconds |
+| `HTTP_RETRY_BACKOFF` | 2 | exponential backoff multiplier for retries |
+| `DIGGER_CONCURRENCY` | unset | global concurrency ceiling for all modules |
+| `DIGGER_STEALTH` | unset | enable stealth/evasion mode |
+| `DIGGER_I_HAVE_PERMISSION` | unset | required for stealth/evasion features |
+| `DIGGER_PROXY` | unset | HTTP/SOCKS proxy URL for all requests |
+| `DIGGER_PROXY_LIST` | unset | path to proxy list file (one per line) |
+| `DIGGER_UA_ROTATE` | unset | rotate User-Agent from built-in pool |
+| `DIGGER_JITTER` | unset | random delay range, e.g. `0.5-2` |
+| `DIGGER_DELAY` | unset | base delay between requests in seconds |
+| `DIGGER_CACHE_DIR` | unset | enable on-disk response cache directory |
+| `DIGGER_CACHE_TTL` | 300 | cache TTL in seconds |
+| `DIGGER_AUDIT_LOG` | unset | path to audit log file |
+| `DIGGER_HTTP2` | unset | prefer HTTP/2 where supported |
 
 Colours are switched off automatically when the output is not a terminal or
 when `TERM=dumb`.
+
+## Performance and stealth features
+
+DIGGER v2.0 introduces a unified performance layer and optional stealth/evasion
+capabilities, all behind an explicit authorization gate.
+
+### Performance improvements (enabled by default)
+
+- **Connection reuse**: all HTTP modules use `curl --keepalive-time` and HTTP/2
+  where available, reducing handshake overhead.
+- **DNS cache**: A/AAAA/PTR/CNAME results are cached in-memory for the duration
+  of a run, eliminating duplicate lookups across modules.
+- **Passive-source cache**: responses from crt.sh, certspotter, subdomain.center,
+  mnemonic, hackertarget, Wayback CDX, RDAP, and ASN lookups are cached by
+  normalized key to avoid re-querying the same source.
+- **Shared concurrency control**: a single bounded job queue replaces per-module
+  implementations. `--concurrency` / `DIGGER_CONCURRENCY` sets a global ceiling;
+  stealth mode automatically lowers the default.
+- **Adaptive backoff**: on HTTP 429/403/502/503 the tool increases delay and
+  reduces concurrency automatically.
+- **Exponential retries**: `HTTP_RETRY_DELAY` and `HTTP_RETRY_BACKOFF` control
+  retry timing globally.
+- **Body reuse**: modules like `info` fetch once and parse multiple times from
+  the same body.
+
+### Stealth / evasion mode (opt-in, requires `--i-have-permission`)
+
+The following features are **disabled by default** and require an explicit
+`--i-have-permission` flag (or `DIGGER_I_HAVE_PERMISSION=1`) to activate.
+This is a safety guardrail: DIGGER will refuse to run stealth features without
+it and will fall back to normal operation.
+
+| Flag / env | Effect |
+|---|---|
+| `--stealth` / `DIGGER_STEALTH=1` | enable all stealth behaviours |
+| `--i-have-permission` / `DIGGER_I_HAVE_PERMISSION=1` | **required** to run stealth mode |
+| `--proxy URL` / `DIGGER_PROXY` | route all HTTP through a single proxy |
+| `--proxy-list FILE` / `DIGGER_PROXY_LIST` | rotate through proxies from a file |
+| `--ua-rotate` / `DIGGER_UA_ROTATE=1` | rotate User-Agent from a built-in pool |
+| `--user-agent STR` | override User-Agent with a custom string |
+| `--jitter MIN-MAX` / `DIGGER_JITTER` | random delay between requests (e.g. `0.5-2`) |
+| `--delay SEC` / `DIGGER_DELAY` | base delay between requests |
+| `--randomize-order` | shuffle probe/target order where safe |
+| `--http2` / `DIGGER_HTTP2=1` | prefer HTTP/2 (also available without stealth) |
+| `--audit-log FILE` / `DIGGER_AUDIT_LOG` | write an audit trail of all stealth actions |
+
+**What stealth mode does:**
+- Adds randomized delays/jitter between every request
+- Rotates User-Agent on each request (when `--ua-rotate` is set)
+- Rotates through a proxy list (when `--proxy-list` is set)
+- Lowers default concurrency to 4
+- Enables adaptive backoff on 429/403/5xx
+- Randomizes request order where it does not break logic
+- Logs every proxied/rotated request to the audit log (if configured)
+
+**What stealth mode does NOT do:**
+- No IP spoofing, no raw sockets, no packet crafting
+- No attempt to hide the fact that requests originate from your host
+- No circumvention of authentication or authorization
+
+### On-disk response cache (optional)
+
+```bash
+./digger.sh subdomains example.com --cache-dir ~/.cache/digger --cache-ttl 3600
+```
+
+Caches raw HTTP responses and DNS results to disk. The cache respects `Cache-Control`
+and `ETag` where present, and expires entries after `DIGGER_CACHE_TTL` seconds.
+Disabled by default for privacy.
 
 ## Data sources
 
