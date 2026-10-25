@@ -4612,11 +4612,13 @@ mod_secrets() {
     (( pages_n >= maxpages )) && break
     seen_page["$u"]=1
     body=$(page_body "$u" 200000)
-    [[ -z "$body" ]] && continue
+    if [[ -z "$body" ]]; then
+      continue
+    fi
     pages_n=$((pages_n + 1))
     scan_secrets_text "$u" "$body"
-    unset body
-
+    local extracted
+    extracted=$(extract_links "$body" 2>/dev/null || true)
     while IFS= read -r link; do
       [[ -z "$link" ]] && continue
       case "${link,,}" in
@@ -4640,7 +4642,8 @@ mod_secrets() {
       if [[ "$ahost" == "$base_host" ]] && (( d < depth )) && [[ -z "${seen_page[$abs]:-}" ]]; then
         queue+=("$((d + 1))|${abs}")
       fi
-    done < <(extract_links "$body" 2>/dev/null || true)
+    done <<< "$extracted"
+    unset body extracted
 
     if gt_zero "$delay"; then jitter_sleep "$delay" 0; fi
   done
