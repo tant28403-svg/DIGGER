@@ -5309,8 +5309,137 @@ show_menu() {
   printf '  {15 } Search Dork Generator\n'
   printf '  {16 } Social Footprint\n'
   printf '  {17 } Network Path\n'
-  printf '\n  { 0 } EXIT\n'
+  printf '\n  %sSETTINGS%s\n' "$C_DIM" "$C_RESET"
+  printf '  { S } Stealth/Evasion Settings'
+  if stealth_active; then printf ' [%sENABLED%s]' "$C_GREEN" "$C_RESET"; fi
+  if stealth_active && ! permission_ok; then printf ' [%sNO PERMISSION%s]' "$C_RED" "$C_RESET"; fi
+  printf '\n'
+  printf '  { 0 } EXIT\n'
   hr 60
+}
+
+stealth_menu() {
+  local choice=''
+  while true; do
+    printf '\n%sSTEALTH / EVASION SETTINGS%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
+    hr 60
+    printf '  Stealth mode: %s\n' "$(stealth_active && printf '%sENABLED%s' "$C_GREEN" "$C_RESET" || printf '%sDISABLED%s' "$C_DIM" "$C_RESET")"
+    printf '  Permission granted: %s\n' "$(permission_ok && printf '%sYES%s' "$C_GREEN" "$C_RESET" || printf '%sNO%s' "$C_RED" "$C_RESET")"
+    printf '  Proxy: %s\n' "${DIGGER_PROXY:-${DIGGER_PROXY_LIST:-none}}"
+    printf '  User-Agent: %s\n' "${USER_AGENT_OVERRIDE:-$(current_user_agent)}"
+    printf '  UA Rotate: %s\n' "${DIGGER_UA_ROTATE:-0}"
+    printf '  Jitter: %s\n' "${DIGGER_JITTER:-none}"
+    printf '  Delay: %s\n' "${DIGGER_DELAY:-none}"
+    printf '  HTTP/2: %s\n' "${DIGGER_HTTP2:-0}"
+    printf '  Audit log: %s\n' "${DIGGER_AUDIT_LOG:-none}"
+    printf '\n'
+    printf '  {1} Toggle stealth mode\n'
+    printf '  {2} Grant/revoke permission (--i-have-permission)\n'
+    printf '  {3} Set single proxy URL\n'
+    printf '  {4} Set proxy list file\n'
+    printf '  {5} Toggle UA rotation\n'
+    printf '  {6} Set custom User-Agent\n'
+    printf '  {7} Set jitter (e.g. 0.5-2)\n'
+    printf '  {8} Set base delay (seconds)\n'
+    printf '  {9} Toggle HTTP/2\n'
+    printf '  {10} Set audit log file\n'
+    printf '  {11} Clear all stealth settings\n'
+    printf '\n  {0} Back to main menu\n'
+    hr 60
+    read -r -p "  choice> " choice || choice=''
+    case "$choice" in
+      1)
+        if stealth_active; then
+          DIGGER_STEALTH=0
+          STEALTH_ENABLED=0
+          info "Stealth mode disabled"
+        else
+          if permission_ok; then
+            DIGGER_STEALTH=1
+            STEALTH_ENABLED=1
+            info "Stealth mode enabled"
+          else
+            warn "Permission required. Grant permission first (option 2)"
+          fi
+        fi
+        ;;
+      2)
+        if permission_ok; then
+          DIGGER_I_HAVE_PERMISSION=""
+          PERMISSION_GRANTED=0
+          DIGGER_STEALTH=0
+          STEALTH_ENABLED=0
+          info "Permission revoked. Stealth disabled."
+        else
+          if confirm "I have explicit written permission to test this target. Continue?"; then
+            DIGGER_I_HAVE_PERMISSION=1
+            PERMISSION_GRANTED=1
+            info "Permission granted"
+          fi
+        fi
+        ;;
+      3)
+        local p
+        p=$(prompt "Proxy URL (e.g. http://host:port)")
+        [[ -n "$p" ]] && DIGGER_PROXY="$p"
+        ;;
+      4)
+        local pl
+        pl=$(prompt "Proxy list file path")
+        [[ -n "$pl" && -f "$pl" ]] && DIGGER_PROXY_LIST="$pl" || warn "File not found"
+        ;;
+      5)
+        if [[ "$DIGGER_UA_ROTATE" == "1" ]]; then
+          DIGGER_UA_ROTATE=0
+          info "UA rotation disabled"
+        else
+          DIGGER_UA_ROTATE=1
+          info "UA rotation enabled"
+        fi
+        ;;
+      6)
+        local ua
+        ua=$(prompt "Custom User-Agent")
+        [[ -n "$ua" ]] && USER_AGENT_OVERRIDE="$ua"
+        ;;
+      7)
+        local j
+        j=$(prompt "Jitter range (e.g. 0.5-2)")
+        [[ -n "$j" ]] && DIGGER_JITTER="$j"
+        ;;
+      8)
+        local d
+        d=$(prompt "Base delay in seconds")
+        [[ -n "$d" ]] && DIGGER_DELAY="$d"
+        ;;
+      9)
+        if [[ "$DIGGER_HTTP2" == "1" ]]; then
+          DIGGER_HTTP2=0
+          info "HTTP/2 disabled"
+        else
+          DIGGER_HTTP2=1
+          info "HTTP/2 enabled"
+        fi
+        ;;
+      10)
+        local al
+        al=$(prompt "Audit log file path")
+        [[ -n "$al" ]] && DIGGER_AUDIT_LOG="$al"
+        ;;
+      11)
+        DIGGER_STEALTH=0; STEALTH_ENABLED=0
+        DIGGER_I_HAVE_PERMISSION=""; PERMISSION_GRANTED=0
+        DIGGER_PROXY=""; DIGGER_PROXY_LIST=""
+        DIGGER_UA_ROTATE=0; USER_AGENT_OVERRIDE=""
+        DIGGER_JITTER=""; DIGGER_DELAY=""
+        DIGGER_HTTP2=0; DIGGER_AUDIT_LOG=""
+        info "All stealth settings cleared"
+        ;;
+      0) return 0 ;;
+      *) warn "invalid option: ${choice}" ;;
+    esac
+    pause
+  done
 }
 
 menu() {
@@ -5318,7 +5447,8 @@ menu() {
   while true; do
     show_menu
     read -r -p "  choice> " choice || choice=''
-    case "$choice" in
+    case "${choice^^}" in
+      S) stealth_menu ;;
       1) mod_myip ;;
       3) mod_dns ;;
       2) mod_info ;;
