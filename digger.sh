@@ -4556,50 +4556,10 @@ mod_secrets() {
   fi
 
   local -A seen_page=()
-  local -a queue=("0|${target}") script_urls=()
+  local -a queue=("0|${target}") corpus_urls=() corpus_bodies=() script_urls=()
   local -A seen_script=()
   local pages_n=0 scripts_n=0
   local entry d u body link abs ahost ext
-
-  local -A seen_find=()
-  local -a high=() medium=() low=()
-  local total_matches=0
-  local scans_done=0
-
-  scan_secrets_text() {
-    local cu="$1" cb="$2"
-    [[ -z "$cb" ]] && return 0
-    local matches m j label level value key masked
-    (( scans_done >= 50 )) && return 0
-    (( scans_done++ ))
-    matches=$(printf '%s' "$cb" | grep -oiE -- "$SECRET_COMBINED" 2>/dev/null | head -n 200 | sort -u || true)
-    [[ -z "$matches" ]] && return 0
-    while IFS= read -r m; do
-      [[ -z "$m" ]] && continue
-      total_matches=$((total_matches + 1))
-      (( total_matches > 200 )) && break
-      m="${m//$'\t'/ }"
-      m="${m//|/-}"
-      label=''; level=''
-      for j in "${!SECRET_REGEXES[@]}"; do
-        if [[ "$m" =~ ${SECRET_REGEXES[$j]} ]]; then
-          label="${SECRET_LABELS[$j]}"
-          level="${SECRET_LEVELS[$j]}"
-          break
-        fi
-      done
-      [[ -z "$label" ]] && continue
-      value=$(secrets_mask "$m")
-      key="${level}|${label}|${value}|${cu}"
-      [[ -n "${seen_find[$key]:-}" ]] && continue
-      seen_find["$key"]=1
-      case "$level" in
-        high)   high+=("${label}|${value}|${cu}") ;;
-        medium) medium+=("${label}|${value}|${cu}") ;;
-        *)      low+=("${label}|${value}|${cu}") ;;
-      esac
-    done <<< "$matches"
-  }
 
   printf '\n  %sfetching pages...%s\n' "$C_DIM" "$C_RESET"
   while (( ${#queue[@]} > 0 )); do
@@ -4611,14 +4571,12 @@ mod_secrets() {
     [[ -n "${seen_page[$u]:-}" ]] && continue
     (( pages_n >= maxpages )) && break
     seen_page["$u"]=1
-    body=$(page_body "$u" 200000)
-    if [[ -z "$body" ]]; then
-      continue
-    fi
+    body=$(page_body "$u" 400000)
+    [[ -z "$body" ]] && continue
     pages_n=$((pages_n + 1))
-    scan_secrets_text "$u" "$body"
-    local extracted
-    extracted=$(extract_links "$body" 2>/dev/null || true)
+    corpus_urls+=("$u")
+    corpus_bodies+=("$body")
+
     while IFS= read -r link; do
       [[ -z "$link" ]] && continue
       case "${link,,}" in
@@ -4642,10 +4600,9 @@ mod_secrets() {
       if [[ "$ahost" == "$base_host" ]] && (( d < depth )) && [[ -z "${seen_page[$abs]:-}" ]]; then
         queue+=("$((d + 1))|${abs}")
       fi
-    done <<< "$extracted"
-    unset body extracted
+    done < <(extract_links "$body" 2>/dev/null || true)
 
-    if gt_zero "$delay"; then jitter_sleep "$delay" 0; fi
+    if gt_zero "$delay"; then sleep "$delay"; fi
   done
 
   if (( pages_n == 0 )); then
@@ -4654,15 +4611,14 @@ mod_secrets() {
   fi
 
   local su sbody
-  if (( ${#script_urls[@]} > 0 && scans_done < 50 )); then
+  if (( ${#script_urls[@]} > 0 )); then
     printf '  %sfetching %s scripts...%s\n' "$C_DIM" "${#script_urls[@]}" "$C_RESET"
     for su in ${script_urls[@]+"${script_urls[@]}"}; do
-      (( scans_done >= 50 )) && break
-      sbody=$(page_body "$su" 300000)
+      sbody=$(page_body "$su" 600000)
       [[ -z "$sbody" ]] && continue
       scripts_n=$((scripts_n + 1))
-      scan_secrets_text "$su" "$sbody"
-      unset sbody
+      corpus_urls+=("$su")
+      corpus_bodies+=("$sbody")
     done
   fi
 
@@ -4670,6 +4626,45 @@ mod_secrets() {
     printf '  %s%s of %s scripts could not be fetched%s\n' \
       "$C_DIM" "$(( ${#script_urls[@]} - scripts_n ))" "${#script_urls[@]}" "$C_RESET"
   fi
+
+  # --- scan ---------------------------------------------------------------
+  local -A seen_find=()
+  local -a high=() medium=() low=()
+  local i j label level value key matches m
+  local total_matches=0
+
+  for i in "${!corpus_urls[@]}"; do
+    matches=$(printf '%s' "${corpus_bodies[$i]}" \
+      | grep -oiE -- "$SECRET_COMBINED" 2>/dev/null \
+      | head -n 400 | sort -u || true)
+    [[ -z "$matches" ]] && continue
+    while IFS= read -r m; do
+      [[ -z "$m" ]] && continue
+      total_matches=$((total_matches + 1))
+      (( total_matches > 400 )) && break
+      m="${m//$'\t'/ }"
+      m="${m//|/-}"
+      label=''
+      level=''
+      for j in "${!SECRET_REGEXES[@]}"; do
+        if [[ "$m" =~ ${SECRET_REGEXES[$j]} ]]; then
+          label="${SECRET_LABELS[$j]}"
+          level="${SECRET_LEVELS[$j]}"
+          break
+        fi
+      done
+      [[ -z "$label" ]] && continue
+      value=$(secrets_mask "$m")
+      key="${level}|${label}|${value}|${corpus_urls[$i]}"
+      [[ -n "${seen_find[$key]:-}" ]] && continue
+      seen_find["$key"]=1
+      case "$level" in
+        high)   high+=("${label}|${value}|${corpus_urls[$i]}") ;;
+        medium) medium+=("${label}|${value}|${corpus_urls[$i]}") ;;
+        *)      low+=("${label}|${value}|${corpus_urls[$i]}") ;;
+      esac
+    done <<< "$matches"
+  done
 
   # --- findings -----------------------------------------------------------
   printf '\n%sFindings%s\n' "$C_BOLD" "$C_RESET"
