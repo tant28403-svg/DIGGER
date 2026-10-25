@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Guard: if invoked from zsh (or any non-bash shell), restart with bash
+# to avoid zsh array/subshell segfaults in interactive/menu modes.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
 #
 # DIGGER v2.0 - passive first, loud when needed
 #
