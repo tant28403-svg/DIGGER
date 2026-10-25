@@ -34,9 +34,15 @@ against systems you own or have explicit written permission to test.
 
 **Capability Notice:** This is a passive-first reconnaissance toolkit for
 authorised assessment and learning. It is not an exploitation framework.
-Optional stealth/evasion features are now available behind an explicit
-`--i-have-permission` gate: proxy rotation, User-Agent rotation, jitter,
-request ordering randomisation and adaptive backoff. Address spoofing is not
+
+**v2.0 Performance layer (enabled by default):** connection reuse (keepalive,
+HTTP/2), in-memory DNS and passive-source caching, shared bounded concurrency
+with adaptive backoff, and exponential retries — all transparent to existing
+workflows.
+
+**Optional stealth/evasion mode (opt-in, requires `--i-have-permission`):**
+proxy rotation, User-Agent rotation, randomised delays/jitter, request ordering
+randomisation, adaptive backoff, and audit logging. Address spoofing is not
 supported. All features send ordinary DNS, HTTP, TLS, TCP or traceroute
 traffic to the target you choose. Third-party data can be incomplete, stale
 or rate-limited, and a finding is a lead to verify — not proof of a
