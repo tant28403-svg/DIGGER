@@ -1136,7 +1136,7 @@ extract_links() {
 
 # --- Module 7: Extract Links ----------------------------------------------
 mod_links() {
-  local target="" depth=5 maxpages=100 delay="0.3" external=0 ignore_robots=0
+  local target="" depth=2 maxpages=15 delay="0.3" external=0 ignore_robots=0
 
   while (( $# > 0 )); do
     case "$1" in
